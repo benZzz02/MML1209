@@ -1,0 +1,51 @@
+# ==============================================================================
+# MML-SurgAdapt Configuration for DualCoCoOp (Dynamic Instance-Specific Prompts)
+# ==============================================================================
+
+# Training Settings
+n_ctx: 4
+checkpoint: cholec_vals
+log_file: surgadapt_dualcocoop.txt
+model_name: surgadapt_dualcocoop
+# [显存策略] 极度消耗显存！必须用极小 Batch + 大累积
+batch_size: 2              # 单卡 Batch 2
+accumulation_steps: 22     # 4 * 3 * 22 = 264 (接近 256)
+lr: 1e-5
+epochs: 15
+reweight_p: 0.2
+relation_file: cholec/word2vec_similarity_matrix.npy
+ratio: 1
+
+# Prompt Learning Settings
+child_n_ctx: 8
+
+change_epoch: 1
+tau: 0.6
+image_size: 224
+num_classes: 110
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+child_num: 110
+label_file: label_jsons/data1.json
+val_sp : True
+val_methods : ['pp_map', 'pp_loss', 'sp_loss']
+perform_init : False
+init_train_file : triplet_train_labels.json
+init_val_file : triplet_val_labels.json
+init_epochs : 5
+init_lr : 1e-5
+dir : trial_dualcocoop
+loss : Hill                # DualCoOp 系列推荐用 Hill Loss
+use_lfile : False
+getitem : False
+
+# Model Architecture
+backbone : ViT-L/14
+seed: 0
+partial: True
+model: SurgAdaptDualCoCoOp # [关键] 使用动态 Prompt 版本
+
+# Testing
+ckpt: temp.ckpt
+test_dir: trial_test_dualcocoop
+test_loss: Hill

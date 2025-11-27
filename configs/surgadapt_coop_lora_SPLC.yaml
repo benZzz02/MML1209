@@ -1,0 +1,61 @@
+# ==============================================================================
+# MML-SurgAdapt Configuration for CoOp (Standard Learnable Prompt)
+# ==============================================================================
+
+# Training Settings
+n_ctx: 16
+checkpoint: cholec_vals/coop_lora_splc
+log_file: surgadapt_coop_lora_splc.txt
+model_name: surgadapt_coop_lora_splc
+
+batch_size: 22
+accumulation_steps: 2     
+lr: 5e-6
+epochs: 15
+reweight_p: 0.2
+relation_file: cholec/word2vec_similarity_matrix.npy
+ratio: 1
+
+# Prompt Learning Settings
+child_n_ctx: 16
+child_ctx_init: a photo of # 可选：使用 "a photo" 初始化，或者注释掉用随机初始化
+
+change_epoch: 1
+tau: 0.6
+image_size: 224
+num_classes: 110
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+child_num: 110
+label_file: label_jsons/data1.json
+val_sp : True
+val_methods : ['pp_map', 'pp_loss', 'sp_loss']
+perform_init : False
+init_train_file : triplet_train_labels.json
+init_val_file : triplet_val_labels.json
+init_epochs : 5
+init_lr : 1e-5
+dir : trial_clip_coop_lora_splc
+loss : SPLC                # CoOp 通常配合 SPLC 或 AsymmetricLoss
+use_lfile : False
+getitem : False
+
+# Model Architecture
+backbone : ViT-L/14
+seed: 0
+partial: True
+model: CLIP-CoOp-LoRA       # [关键] 使用基础 CoOp 类
+
+# Testing
+ckpt: temp.ckpt
+test_dir: trial_test_clip_coop_lora_splc
+test_loss: SPLC
+
+
+#LoRa配置
+LORA:
+  ENABLED: True             # 是否启用 LoRA
+  R: 8                      # LoRA 的秩
+  ALPHA: 16                 # LoRA 的缩放因子
+  DROPOUT: 0.05             # LoRA 的 Dropout
+  TARGET_MODULES: ["c_fc", "c_proj", "out_proj"] # 目标模块，例如注意力层的 Q/V 投影

@@ -1,0 +1,51 @@
+# ==============================================================================
+# MML-SurgAdapt Configuration for DualCoOp (Dual Context Optimization)
+# ==============================================================================
+
+# Training Settings
+n_ctx: 4                   # (Legacy) 保留参数，实际由 child_n_ctx 控制
+checkpoint: cholec_vals/dualcoop    # Checkpoint 保存根目录
+log_file: surgadapt_dualcoop.txt # 修改日志文件名以区分
+model_name: surgadapt_dualcoop   # 修改模型名标识
+batch_size: 16             # 建议稍微调小一点 (如32)，因为 DualCoOp 计算量是单路的2倍
+accumulation_steps: 3
+lr: 1e-5                   # 学习率
+epochs: 10                 # 训练轮数
+reweight_p: 0.2
+relation_file: cholec/word2vec_similarity_matrix.npy
+ratio: 1
+
+# Prompt Learning Settings (DualCoOp)
+child_n_ctx: 8            # 上下文向量长度。DualCoOp 将学习两组长度为 8 的向量 (Pos/Neg)
+child_ctx_init: a photo of # 注释掉，DualCoOp 通常使用随机初始化来寻找正负边界
+
+change_epoch: 1            # Warmup epoch
+tau: 0.6
+image_size: 224
+num_classes: 110
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+child_num: 110
+label_file: label_jsons/data1.json
+val_sp : True
+val_methods : ['pp_map', 'pp_loss', 'sp_loss']
+perform_init : False
+init_train_file : triplet_train_labels.json
+init_val_file : triplet_val_labels.json
+init_epochs : 5
+init_lr : 1e-5
+dir : trial_dualcoop       # 修改结果保存目录
+loss : Hill                # Loss function (DualCoOp 的 Logits 差分输出完美适配 Hill/BCE)
+use_lfile : False
+getitem : False
+
+# Model Architecture
+backbone : ViT-L/14        # CLIP Backbone
+seed: 0
+partial: True
+model: SurgAdapt-DualCoOp   # [关键修改] 启用 DualCoOp 模型类
+
+# Testing
+ckpt: temp.ckpt
+test_dir: trial_test_dualcoop # 修改测试结果目录
+test_loss: Hill
