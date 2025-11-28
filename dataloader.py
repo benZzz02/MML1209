@@ -336,39 +336,44 @@ class Cholec_Train(torch.utils.data.Dataset):
 
         return data
 
-    def update_labels(self, new_labels):
-            """
-            new_labels: numpy array [N, Num_Classes]
-            用 CAP 生成的伪标签填补假阴性 (合并操作)
-            """
-            if len(new_labels) != len(self.data):
-                logger.warning(f"[CAP] Label size mismatch! Dataset: {len(self.data)}, New: {len(new_labels)}")
-                return
+    def update_labels(self, new_labels, indices):
+        """
+        new_labels: 当前 GPU 计算出的伪标签 [N_subset, C]
+        indices: 这些伪标签对应的全局索引 [N_subset]
+        """
+        # 安全检查
+        if len(new_labels) != len(indices):
+            logger.warning(f"[CAP] Error: Labels ({len(new_labels)}) and Indices ({len(indices)}) mismatch!")
+            return
 
-            count_changed = 0
-            # 遍历更新 self.data 中的 label
-            for i in range(len(self.data)):
-                # self.data[i] = [impath, label_tensor, video_id]
-                original_label = self.data[i][1]
-                
-                # 如果是 tensor, 转 numpy 操作再转回 (或者直接操作 tensor)
-                if isinstance(original_label, torch.Tensor):
-                    np_orig = original_label.numpy()
-                else:
-                    np_orig = original_label
-
-                # 取并集：保留原有 1，填补 CAP 的 1
-                # Logic: new_label = max(original, pseudo)
-                new_label_np = np.maximum(np_orig, new_labels[i])
-                
-                # 统计变化
-                if not np.array_equal(np_orig, new_label_np):
-                    count_changed += 1
-                
+        count_changed = 0
+        
+        # [核心逻辑] 根据索引，精准更新 self.data 中的特定行
+        for i, global_idx in enumerate(indices):
+            # 确保索引是整数
+            idx = int(global_idx)
+            
+            # 获取原始数据：self.data[idx] = [impath, label, vid]
+            original_entry = self.data[idx]
+            original_label = original_entry[1]
+            
+            # 类型转换处理
+            if isinstance(original_label, torch.Tensor):
+                np_orig = original_label.numpy()
+            else:
+                np_orig = np.array(original_label)
+            
+            # 取并集：只填补假阴性 (0->1)，不修改已有正样本 (1->1)
+            new_label_vec = new_labels[i]
+            updated_label_np = np.maximum(np_orig, new_label_vec)
+            
+            # 如果有变化，则更新
+            if not np.array_equal(np_orig, updated_label_np):
+                count_changed += 1
                 # 写回 Dataset
-                self.data[i][1] = torch.from_numpy(new_label_np).float()
-
-            logger.info(f"[CAP] Updated labels for {count_changed} samples.")
+                self.data[idx][1] = torch.from_numpy(updated_label_np).float()
+        
+        logger.info(f"[CAP] Rank update: {len(new_labels)} samples processed, {count_changed} labels improved.")
 
     def random_pick_one(self,tensor):
 
@@ -386,21 +391,18 @@ class Cholec_Train(torch.utils.data.Dataset):
 
         return tensor
 
-    def __getitem__(self,index):
-
+    def __getitem__(self, index):
         impath, label, vid = self.data[index]
-
         image = Image.open(impath).convert("RGB")
 
         if not self.partial:
-
             if self.f: label = self.random_pick_one(label)
 
         if self.transform: image = self.transform(image)
-
         if not self.partial: assert torch.sum(label) < 2
 
-        return image, label, vid
+        # [修改] 返回 4 个值，最后加上 index
+        return image, label, vid, index
 
     def __len__(self): return len(self.data)
 
@@ -560,40 +562,59 @@ class CholecDataset(torch.utils.data.Dataset):
 
         self.data = label_list
         
-    def update_labels(self, new_labels):
-        if len(new_labels) != len(self.data):
-            logger.warning(f"[CAP] Label size mismatch!")
+    def update_labels(self, new_labels, indices):
+        """
+        new_labels: 当前 GPU 计算出的伪标签 [N_subset, C]
+        indices: 这些伪标签对应的全局索引 [N_subset]
+        """
+        # 安全检查
+        if len(new_labels) != len(indices):
+            logger.warning(f"[CAP] Error: Labels ({len(new_labels)}) and Indices ({len(indices)}) mismatch!")
             return
-            
+
         count_changed = 0
-        for i in range(len(self.data)):
-            # self.data[i] = [impath, label_list/tensor, video_id]
-            # 注意：这里 self.data[i] 可能是一个 list，需要直接修改它的第2个元素
-            original_label = self.data[i][1]
-            
-            np_orig = np.array(original_label)
-            new_label_np = np.maximum(np_orig, new_labels[i])
-            
-            if not np.array_equal(np_orig, new_label_np):
-                count_changed += 1
-
-            # CholecDataset 在 __getitem__ 里做 torch.Tensor(label)，所以这里存 list 或 array 都可以
-            self.data[i][1] = new_label_np
-
-        logger.info(f"[CAP] Updated labels for {count_changed} samples.")
         
-    def __getitem__(self,index):
-
+        # [核心逻辑] 根据索引，精准更新 self.data 中的特定行
+        for i, global_idx in enumerate(indices):
+            # 确保索引是整数
+            idx = int(global_idx)
+            
+            # 获取原始数据：self.data[idx] = [impath, label, vid]
+            original_entry = self.data[idx]
+            original_label = original_entry[1]
+            
+            # 类型转换处理
+            if isinstance(original_label, torch.Tensor):
+                np_orig = original_label.numpy()
+            else:
+                np_orig = np.array(original_label)
+            
+            # 取并集：只填补假阴性 (0->1)，不修改已有正样本 (1->1)
+            new_label_vec = new_labels[i]
+            updated_label_np = np.maximum(np_orig, new_label_vec)
+            
+            # 如果有变化，则更新
+            if not np.array_equal(np_orig, updated_label_np):
+                count_changed += 1
+                # 写回 Dataset
+                self.data[idx][1] = torch.from_numpy(updated_label_np).float()
+        
+        logger.info(f"[CAP] Rank update: {len(new_labels)} samples processed, {count_changed} labels improved.")
+        
+    # 1. 修改 __getitem__，多返回一个 index
+    def __getitem__(self, index):
         impath, label, vid = self.data[index]
-
         image = Image.open(impath).convert("RGB")
 
-        label = torch.Tensor(label)
+        if not self.partial:
+            if self.f: label = self.random_pick_one(label)
 
         if self.transform: image = self.transform(image)
+        if not self.partial: assert torch.sum(label) < 2
 
-        return image , label, vid
-
+        # [修改] 返回 4 个值，最后加上 index
+        return image, label, vid, index
+    
     def __len__(self): return len(self.data)
 
     def labels(self):

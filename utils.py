@@ -404,66 +404,54 @@ def estimate_class_distribution(dataset, num_classes):
     
     logger.info(f"[CAP] Distribution estimated. Max freq: {pos_freq.max():.4f}, Min freq: {pos_freq.min():.4f}")
     return pos_freq
+# 文件: utils.py (覆盖之前的 run_cap_procedure)
 
 @torch.no_grad()
 def run_cap_procedure(trainer, loader, pos_freq, device):
-    """
-    [CAP Step 2] 核心流程：预测 -> 排序 -> 动态截断 -> 生成伪标签 -> 更新 Dataset
-    """
-    if pos_freq is None:
-        return
+    if pos_freq is None: return
 
     logger.info(">>> [CAP] Running CAP: Generating Class-Aware Pseudo-Labels...")
-    
-    # 切换到评估模式 (关闭 Dropout/BN更新)
     model = trainer.model
     model.eval()
     
     all_preds = []
+    all_indices = []  # [新增] 用于收集索引
     
-    # 1. 全量推理 (Inference on Training Set)
-    # 遍历传入的 loader (通常是 train_loader)
-    for i, (input, target, vid) in enumerate(loader):
+    # 1. 全量推理
+    # 注意：这里现在解包 4 个变量
+    for i, (input, target, vid, idx) in enumerate(loader):
         input = input.to(device, non_blocking=True)
         with autocast():
-            # 获取模型输出 logits
             logits = model(input)
-            # 转为概率 (Sigmoid)
             probs = torch.sigmoid(logits)
+        
         all_preds.append(probs.detach().cpu().numpy())
-    
-    # 拼接所有预测结果 [N, C]
+        all_indices.append(idx.detach().cpu().numpy()) # [新增] 收集 Index
+
+    if len(all_preds) == 0: return
+
+    # 拼接
     all_probs = np.concatenate(all_preds, axis=0)
+    all_indices = np.concatenate(all_indices, axis=0) # [新增]
+    
     num_samples = all_probs.shape[0]
     num_classes = all_probs.shape[1]
     
-    logger.info(f"[CAP] Inference done. Samples: {num_samples}")
-
     # 2. 类别感知阈值 (CAT)
-    # 对每一列（类别）的概率进行降序排列 (-x 升序排列 = x 降序排列)
     sorted_probs = -np.sort(-all_probs, axis=0)
-    
-    # 计算截断位置：Top (pos_freq * N)
-    # 我们强制让当前预测中 Top (pos_freq * N) 的样本变成正样本，找回假阴性
     cutoff_indices = np.floor(pos_freq * num_samples).astype(int)
-    
-    # 防止索引越界
     cutoff_indices = np.clip(cutoff_indices - 1, 0, num_samples - 1)
-    
-    # 获取每个类别的动态阈值向量 [C]
     thresholds = sorted_probs[cutoff_indices, range(num_classes)]
     
     # 3. 生成伪标签
-    # 只要预测概率 >= 该类别的动态阈值，就标记为 1
     pseudo_labels = (all_probs >= thresholds).astype(np.float32)
     
-    # 4. 更新 Dataset
-    # 调用 dataset 的 update_labels 方法
+    # 4. 更新 Dataset (传入索引)
     if hasattr(loader.dataset, 'update_labels'):
-        loader.dataset.update_labels(pseudo_labels)
+        # [修改] 将 pseudo_labels 和 all_indices 一起传入
+        loader.dataset.update_labels(pseudo_labels, all_indices)
     else:
         logger.warning("[CAP] Dataset does not have 'update_labels' method. CAP skipped.")
 
-    # 恢复训练模式
     model.train()
     logger.info(">>> [CAP] Procedure finished.\n")

@@ -593,8 +593,15 @@ def train(trainer, dir) -> None:
         # ====================================================
     
         optimizer.zero_grad()
-        for i, (input, target, _) in enumerate(trainer.train_loader):
+        for i, batch_data in enumerate(trainer.train_loader):
+            # 手动解包，取前两个，忽略后面所有的(vid, index)
+            input = batch_data[0]
+            target = batch_data[1]
+            
+            # 移至 GPU
             target = target.cuda(non_blocking=True)
+            input = input.cuda(non_blocking=True)
+            
             loss = trainer.train(input, target, criterion, epoch, i)
             loss = loss / accumulation_steps
             scaler.scale(loss).backward()
