@@ -423,6 +423,22 @@ def run_cap_procedure(trainer, loader, class_ratio, device, ratio=1.0):
         return
 
     logger.info(f">>> [CAP] Running CAP: ratio={ratio}...")
+    
+    if dist.is_initialized():
+        num_classes = len(class_ratio) if class_ratio is not None else 110
+        
+        # 创建 tensor 用于广播
+        if dist.get_rank() == 0:
+            class_ratio_tensor = torch.from_numpy(np.array(class_ratio)).float().to(device)
+        else:
+            class_ratio_tensor = torch.zeros(num_classes, dtype=torch.float32, device=device)
+        
+        # 从 rank 0 广播到所有 rank
+        dist.broadcast(class_ratio_tensor, src=0)
+        
+        # 转回 numpy
+        class_ratio = class_ratio_tensor.cpu().numpy()
+    
     model = trainer.model
     model.eval()
     
