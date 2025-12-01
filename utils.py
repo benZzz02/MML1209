@@ -422,26 +422,40 @@ def run_cap_procedure(trainer, loader, pos_freq, device, ratio=1.0):
     local_preds_list = []
     local_indices_list = []
     
-    # 遍历本地分到的数据切片
-    for i, batch_data in enumerate(loader):
-        # 兼容不同的 Dataset 返回值 (img, label, vid, index)
+    for _, batch_data in enumerate(loader):
         input = batch_data[0].to(device, non_blocking=True)
-        idx = batch_data[-1] # 假设 index 总是最后一个返回
+        idx = batch_data[-1]
         
         with autocast():
-            logits = model(input)
-            probs = torch.sigmoid(logits)
+            logits = model(input) # 形状 [B, 110]
+            
+            # =========== [修改开始] 针对不同任务分段计算概率 ===========
+            
+            # 任务1: 阶段 (0-6) -> 假设是单标签互斥任务，使用 Softmax
+            logits_phase = logits[:, :7]
+            probs_phase = torch.softmax(logits_phase, dim=1)
+            
+            # 任务2: Endoscapes (7-9) -> 视具体定义而定，这里假设保持 Sigmoid
+            logits_endo = logits[:, 7:10]
+            probs_endo = torch.sigmoid(logits_endo)
+            
+            # 任务3: 细粒度动作 (10-110) -> 多标签任务，使用 Sigmoid
+            logits_action = logits[:, 10:]
+            probs_action = torch.sigmoid(logits_action)
+            
+            # 将三段概率拼接回 [B, 110] 的大矩阵
+            probs = torch.cat([probs_phase, probs_endo, probs_action], dim=1)
+            
+            # =========== [修改结束] ===================================
         
         local_preds_list.append(probs)
         local_indices_list.append(idx.to(device))
-
-    if len(local_preds_list) == 0: 
+    if len(local_preds_list) > 0:
+            local_probs = torch.cat(local_preds_list, dim=0)      # [N_local, 110]
+            local_indices = torch.cat(local_indices_list, dim=0)  # [N_local]
+    else:
+            # 防止有些卡分不到数据的情况（虽然很少见）
         return
-
-    # 拼接本地结果
-    local_probs = torch.cat(local_preds_list, dim=0)      # [N_local, C]
-    local_indices = torch.cat(local_indices_list, dim=0)  # [N_local]
-
     # 2. 全局汇总 (Global Gather) - 仅在 DDP 模式下触发
     if dist.is_initialized():
         world_size = dist.get_world_size()
