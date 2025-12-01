@@ -487,8 +487,9 @@ def train(trainer, dir) -> None:
     scaler = GradScaler()
     # ================= [CAP] 初始化准备 =================
     # 1. 读取配置开关 (建议在 config.py 或 base.yaml 里加，或者这里给默认值)
-    use_cap = getattr(cfg, 'use_cap', False)  # 默认为 False，需要在 yaml 里设为 True
-    cap_start_epoch = getattr(cfg, 'cap_start_epoch', 3) # 前 3 轮 Warmup
+    use_cap = getattr(cfg, 'use_cap', False)
+    cap_start_epoch = getattr(cfg, 'cap_start_epoch', 5) # 建议推迟到 5-8
+    cap_ratio = getattr(cfg, 'cap_ratio', 0.6) # [重要] 默认 0.6，保守策略
     
     pos_freq = None
     if use_cap:
@@ -575,21 +576,17 @@ def train(trainer, dir) -> None:
         # 每个 Epoch 开始前，运行 CAP 更新伪标签
         # 注意：只在 epoch >= cap_start_epoch 后执行
         if use_cap and epoch >= cap_start_epoch and pos_freq is not None:
-            # 在运行 CAP 前，最好确保 DDP 同步
-            if dist.is_initialized(): dist.barrier()
-            
-            # 只需要在每个进程上对自己的数据运行即可 (简化版实现)
-            # 如果想要完全精确的全局排序，需要 gather 所有预测，但这会消耗大量显存
-            # 只要数据 Shuffle 良好，局部排序近似于全局排序
-            run_cap_procedure(
+             if dist.is_initialized(): dist.barrier()
+             
+             run_cap_procedure(
                 trainer, 
                 trainer.train_loader, 
                 pos_freq, 
-                device=torch.device(f"cuda:{cfg.gpu_id}")
+                device=torch.device(f"cuda:{cfg.gpu_id}"),
+                ratio=cap_ratio  # [新增] 传入 ratio
             )
-            
-            # CAP 结束后同步一下，确保所有进程都更新完了数据
-            if dist.is_initialized(): dist.barrier()
+             
+             if dist.is_initialized(): dist.barrier()
         # ====================================================
     
         optimizer.zero_grad()

@@ -1,11 +1,11 @@
 # Training
 n_ctx: 4
-checkpoint: cholec_vals/surgadapt_cap_hill    # For saving checkpoints
-log_file: surgadapt_cap_hill.txt
-model_name: surgadapt_gcn_cap_hill
+checkpoint: cholec_vals/surgadapt_cap_bce    # For saving checkpoints
+log_file: surgadapt_cap_bce.txt
+model_name: surgadapt_gcn_cap_bce
 batch_size: 39
 lr: 1e-5
-epochs: 10
+epochs: 20
 reweight_p: 0.2
 relation_file: cholec/word2vec_similarity_matrix.npy
 ratio: 1
@@ -22,7 +22,7 @@ tau: 0.6        # SPLC 的阈值 (如果使用 SPLC)
 # 1. ASL: CAP 论文原配 Loss，处理正负样本不平衡效果最好。
 # 2. SPLC: 可以结合 CAP。CAP 负责找回假阴性，SPLC 负责加 Margin 提升鲁棒性。
 # 3. Hill: 您原本的 Loss，也可以直接兼容 CAP。
-loss : Hill      # 当前保持 Hill，想换可以改为 'ASL' 或 'SPLC'
+loss : BCE      # 当前保持 BCE，想换可以改为 'ASL' 或 'SPLC'
 
 image_size: 224
 num_classes: 110
@@ -37,7 +37,7 @@ init_train_file : triplet_train_labels.json # Init labels
 init_val_file : triplet_val_labels.json # Init labels
 init_epochs : 5
 init_lr : 1e-5
-dir : trial_surgadapt_cap_hill  # Directory to save results
+dir : trial_surgadapt_cap_bce  # Directory to save results
 
 use_lfile : False  # If use label file
 getitem : False # If call random in getitem
@@ -54,11 +54,11 @@ model: SurgAdapt
 use_cap: True         
 # CAP 开始介入的 Epoch。建议设为 3-5，让模型先通过原始标签学一点特征。
 # 必须 >= 0。如果想一开始就用，设为 0 (但不推荐)。
-cap_start_epoch: 2  
-cap_ratio: 0.1 # CAP 伪标签的置信度阈值，范围 [0,1]。越大越保守。
+cap_start_epoch: 5    
+cap_ratio: 0.2 # CAP 伪标签的置信度阈值，范围 [0,1]。越大越保守。
 # accumulation_steps: 1 # 如果显存不够，可以在这里设置梯度累积步数
 
 # Testing
 ckpt: temp.ckpt  # Ckpt path for inference
-test_dir: trial_test_surgadapt_cap_hill # Directory to save results
-test_loss: Hill  # Loss function
+test_dir: trial_test_surgadapt_cap_bce # Directory to save results
+test_loss: BCE  # Loss function
