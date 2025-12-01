@@ -366,169 +366,189 @@ def get_ema_co():
 # =============================================================================
 # [CAP] Class-Aware Pseudo-Labeling Utils
 # =============================================================================
-
 def estimate_class_distribution(dataset, num_classes):
     """
-    [CAP Step 1] 计算已标注数据的类别分布 (Pos Frequency)
-    对应论文中的 gamma_hat
+    [CAP Step 1] 计算每个类别在正样本图片中的占比
+    
+    阈值[c] = 该类正样本图片数 / 所有正样本图片总数
     """
     logger.info("[CAP] Estimating class distribution from dataset...")
     
-    # 1. 尝试直接获取 labels (CholecDataset / Cholec_Train)
     targets = None
     
-    # 情况 A: Cholec_Train (self.data 是 list)
     if hasattr(dataset, 'data') and isinstance(dataset.data, list):
         try:
-            # self.data 结构: [[path, label_tensor, vid], ...]
-            # 我们只提取 label_tensor
-            all_labels = [d[1].numpy() if isinstance(d[1], torch.Tensor) else d[1] for d in dataset.data]
-            targets = np.array(all_labels)
+            all_labels = [d[1]. numpy() if isinstance(d[1], torch.Tensor) else np.array(d[1]) for d in dataset.data]
+            targets = np. array(all_labels)
         except Exception as e:
             logger.warning(f"[CAP] Failed to parse 'dataset.data' list: {e}")
 
-    # 情况 B: 拥有 .labels 属性 (如果未来更改了实现)
-    if targets is None and hasattr(dataset, 'labels') and not callable(dataset.labels):
-         targets = np.array(dataset.labels)
-
     if targets is None:
-        logger.error("[CAP] Could not find labels in dataset to estimate distribution.")
+        logger.error("[CAP] Could not find labels in dataset.")
         return None
 
-    n_total = len(targets)
-    if n_total == 0: return None
-
-    # 计算每个类别的正样本频率
-    # axis=0 表示沿样本维度求和
-    pos_freq = np.sum(targets == 1, axis=0) / n_total
+    # targets 形状: [N, 110]，值为 0 或 1
     
-    logger.info(f"[CAP] Distribution estimated. Max freq: {pos_freq.max():.4f}, Min freq: {pos_freq.min():.4f}")
-    return pos_freq
+    # 统计每个类别的正样本图片数
+    pos_count_per_class = np.sum(targets == 1, axis=0)  # 形状 [110]
+    
+    # 统计所有正样本图片总数（至少有一个类别为1的图片）
+    has_positive = np.any(targets == 1, axis=1)  # 形状 [N]，每张图片是否有正样本
+    total_positive_images = np.sum(has_positive)
+    
+    if total_positive_images == 0:
+        logger.error("[CAP] No positive samples found.")
+        return None
+    
+    # 每个类别的阈值 = 该类正样本数 / 正样本图片总数
+    class_ratio = pos_count_per_class / total_positive_images
+    
+    logger.info(f"[CAP] Total positive images: {total_positive_images}")
+    logger.info(f"[CAP] Class ratio - Max: {class_ratio.max():.4f}, Min: {class_ratio.min():.4f}, Sum: {class_ratio.sum():.4f}")
+    
+    return class_ratio
 
 
 @torch.no_grad()
-def run_cap_procedure(trainer, loader, pos_freq, device, ratio=1.0):
+def run_cap_procedure(trainer, loader, class_ratio, device, ratio=1.0):
     """
-    [CAP Step 2 - Global Ranking Version]
-    包含统计每个类别新增伪标签数量的功能 (全量显示版)
+    [CAP Step 2] 在负样本中生成伪标签
+    
+    对于每个类别 c:
+        1. 找出该类的负样本（target[c] == 0）
+        2. 计算预测概率并排序
+        3. 选择前 K = 负样本数 × class_ratio[c] × ratio 个作为伪正标签
     """
-    if pos_freq is None: return
+    if class_ratio is None:
+        return
 
-    logger.info(f">>> [CAP] Running CAP (Global Ranking): Ratio={ratio}...")
+    logger.info(f">>> [CAP] Running CAP: ratio={ratio}...")
     model = trainer.model
     model.eval()
     
-    # 1. 本地推理 (Local Inference)
+    # 1. 收集所有样本的预测概率和原始标签
     local_preds_list = []
     local_indices_list = []
     local_targets_list = []
     
     for _, batch_data in enumerate(loader):
         input = batch_data[0].to(device, non_blocking=True)
-        target = batch_data[1].to(device, non_blocking=True) 
+        target = batch_data[1]. to(device, non_blocking=True)
         idx = batch_data[-1]
         
         with autocast():
-            logits = model(input) # 形状 [B, 110]
+            logits = model(input)
             
-            # 任务1: 阶段 (0-6) - Softmax
-            logits_phase = logits[:, :7]
-            probs_phase = torch.softmax(logits_phase, dim=1)
-            
-            # 任务2: Endoscapes (7-9) - Sigmoid
-            logits_endo = logits[:, 7:10]
-            probs_endo = torch.sigmoid(logits_endo)
-            
-            # 任务3: 细粒度动作 (10-110) - Sigmoid
-            logits_action = logits[:, 10:]
-            probs_action = torch.sigmoid(logits_action)
+            # Phase (0-6): Softmax
+            probs_phase = torch.softmax(logits[:, :7], dim=1)
+            # Endoscapes (7-9): Sigmoid
+            probs_endo = torch.sigmoid(logits[:, 7:10])
+            # Actions (10-110): Sigmoid
+            probs_action = torch.sigmoid(logits[:, 10:])
             
             probs = torch.cat([probs_phase, probs_endo, probs_action], dim=1)
         
         local_preds_list.append(probs)
-        local_indices_list.append(idx.to(device))
+        local_indices_list.append(idx. to(device))
         local_targets_list.append(target)
-        
-    if len(local_preds_list) > 0:
-        local_probs = torch.cat(local_preds_list, dim=0)      # [N_local, 110]
-        local_indices = torch.cat(local_indices_list, dim=0)  # [N_local]
-        local_targets = torch.cat(local_targets_list, dim=0)  # [N_local, 110]
-    else:
+    
+    if len(local_preds_list) == 0:
         return
-
-    # 2. 全局汇总 (Global Gather)
+    
+    local_probs = torch.cat(local_preds_list, dim=0)
+    local_indices = torch. cat(local_indices_list, dim=0)
+    local_targets = torch. cat(local_targets_list, dim=0)
+    
+    # 2.  全局汇总（DDP）
     if dist.is_initialized():
-        world_size = dist.get_world_size()
+        world_size = dist. get_world_size()
+        
         gathered_probs = [torch.zeros_like(local_probs) for _ in range(world_size)]
+        gathered_indices = [torch.zeros_like(local_indices) for _ in range(world_size)]
+        gathered_targets = [torch.zeros_like(local_targets) for _ in range(world_size)]
+        
         dist.all_gather(gathered_probs, local_probs)
+        dist.all_gather(gathered_indices, local_indices)
+        dist. all_gather(gathered_targets, local_targets)
+        
         global_probs = torch.cat(gathered_probs, dim=0)
+        global_indices = torch.cat(gathered_indices, dim=0)
+        global_targets = torch.cat(gathered_targets, dim=0)
     else:
         global_probs = local_probs
-
-    # 3. 计算全局动态阈值
+        global_indices = local_indices
+        global_targets = local_targets
+    
+    # 3. 转换为 numpy
     global_probs_np = global_probs.float().cpu().numpy()
-    num_global_samples = global_probs_np.shape[0]
-    num_classes = global_probs_np.shape[1]
+    global_indices_np = global_indices.cpu().numpy()
+    global_targets_np = global_targets. float().cpu().numpy()
     
-    # 排序
-    sorted_global = -np.sort(-global_probs_np, axis=0)
+    num_samples = global_probs_np.shape[0]
+    num_classes = global_probs_np. shape[1]
     
-    # 计算截断
-    cutoff_indices = np.floor(pos_freq * num_global_samples * ratio).astype(int)
-    cutoff_indices = np.clip(cutoff_indices - 1, 0, num_global_samples - 1)
+    # 4. 为每个类别生成伪标签（只在负样本中选择）
+    global_pseudo_labels = np.zeros_like(global_probs_np, dtype=np.float32)
+    pseudo_counts = np.zeros(num_classes, dtype=np.int32)
     
-    thresholds = sorted_global[cutoff_indices, range(num_classes)]
+    for c in range(num_classes):
+        # 找出该类别的负样本（原始标签为 0）
+        negative_mask = (global_targets_np[:, c] == 0)
+        num_negatives = negative_mask.sum()
+        
+        if num_negatives == 0:
+            continue
+        
+        # 计算 K = 负样本数 × class_ratio[c] × ratio
+        k = int(np.floor(num_negatives * class_ratio[c] * ratio))
+        
+        if k <= 0:
+            continue
+        
+        # 获取负样本的索引和概率
+        negative_indices = np.where(negative_mask)[0]
+        negative_probs = global_probs_np[negative_indices, c]
+        
+        # 按概率降序排序
+        sorted_order = np.argsort(-negative_probs)
+        
+        # 选择前 K 个
+        top_k_in_negatives = sorted_order[:k]
+        top_k_global_indices = negative_indices[top_k_in_negatives]
+        
+        # 标记为伪正标签
+        global_pseudo_labels[top_k_global_indices, c] = 1.0
+        pseudo_counts[c] = k
     
-    if dist.is_initialized() and dist.get_rank() == 0:
-        logger.info(f"[CAP] Global Thresholds - Max: {thresholds.max():.4f}, Min: {thresholds.min():.4f}, Mean: {thresholds.mean():.4f}")
-
-    # 4. 本地生成伪标签
-    local_probs_np = local_probs.float().cpu().numpy()
-    pseudo_labels = (local_probs_np >= thresholds).astype(np.float32)
-    
-    # ===============================================================
-    # [新增功能] 统计每个类别新增了多少正样本 (全量打印)
-    # ===============================================================
-    local_targets_np = local_targets.float().cpu().numpy()
-    
-    # 逻辑：新标签是1 且 旧标签是0
-    added_mask = np.logical_and(pseudo_labels == 1, local_targets_np == 0)
-    local_added_counts = added_mask.sum(axis=0) # 形状 [110]
-    
-    # 转回 Tensor 以便在多卡间求和
-    added_counts_tensor = torch.from_numpy(local_added_counts).to(device)
-    
-    # 如果是 DDP，把所有卡的增量加起来
-    if dist.is_initialized():
-        dist.all_reduce(added_counts_tensor, op=dist.ReduceOp.SUM)
-    
-    # 仅主进程打印日志
+    # 5. 打印统计信息
     if not dist.is_initialized() or dist.get_rank() == 0:
-        final_counts = added_counts_tensor.cpu().numpy().astype(int)
-        total_new = final_counts.sum()
+        total_pseudo = pseudo_counts.sum()
+        logger.info(f"====== [CAP Stats] Total Pseudo Positives: {total_pseudo} ======")
         
-        logger.info(f"====== [CAP Stats] Total New Pseudo Positives: {total_new} ======")
-        
-        # 构建包含所有类别统计信息的长字符串
-        # 格式: C0:5 C1:0 C2:12 ...
-        stats_str_list = [f"C{c}:{count}" for c, count in enumerate(final_counts)]
-        
-        # 为了阅读方便，每行打印10个类别，但通过拼接字符串的方式确保完整输出
+        stats_str_list = [f"C{c}:{count}" for c, count in enumerate(pseudo_counts)]
         chunk_size = 10
         for i in range(0, num_classes, chunk_size):
             chunk = stats_str_list[i:i+chunk_size]
             logger.info(" ".join(chunk))
-            
         logger.info("================================================================")
-    # ===============================================================
-
-    # 5. 本地更新 Dataset
-    local_indices_np = local_indices.cpu().numpy()
     
+    # 6. 分发伪标签回本地，并更新 Dataset
+    index_to_position = {int(idx): pos for pos, idx in enumerate(global_indices_np)}
+    
+    local_indices_np = local_indices. cpu().numpy()
+    local_pseudo_labels = np.zeros((len(local_indices_np), num_classes), dtype=np. float32)
+    
+    for i, local_idx in enumerate(local_indices_np):
+        global_pos = index_to_position. get(int(local_idx), -1)
+        if global_pos >= 0:
+            local_pseudo_labels[i] = global_pseudo_labels[global_pos]
+    
+    # 更新 Dataset（覆盖模式）
     if hasattr(loader.dataset, 'update_labels'):
-        loader.dataset.update_labels(pseudo_labels, local_indices_np)
+        loader. dataset.update_labels(local_pseudo_labels, local_indices_np)
     else:
-        logger.warning("[CAP] Dataset missing 'update_labels'. Skipped.")
-
+        logger.warning("[CAP] Dataset missing 'update_labels'.  Skipped.")
+    
     model.train()
-    if dist.is_initialized(): dist.barrier()
+    if dist.is_initialized():
+        dist. barrier()
