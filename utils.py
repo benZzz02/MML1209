@@ -404,13 +404,13 @@ def estimate_class_distribution(dataset, num_classes):
     
     logger.info(f"[CAP] Distribution estimated. Max freq: {pos_freq.max():.4f}, Min freq: {pos_freq.min():.4f}")
     return pos_freq
-# 文件: utils.py (覆盖之前的 run_cap_procedure)
+
 
 @torch.no_grad()
 def run_cap_procedure(trainer, loader, pos_freq, device, ratio=1.0):
     """
     [CAP Step 2 - Global Ranking Version]
-    全局预测 -> 全局汇总 -> 全局排序定阈值 -> 本地更新
+    包含统计每个类别新增伪标签数量的功能 (全量显示版)
     """
     if pos_freq is None: return
 
@@ -421,94 +421,108 @@ def run_cap_procedure(trainer, loader, pos_freq, device, ratio=1.0):
     # 1. 本地推理 (Local Inference)
     local_preds_list = []
     local_indices_list = []
+    local_targets_list = []
     
     for _, batch_data in enumerate(loader):
         input = batch_data[0].to(device, non_blocking=True)
+        target = batch_data[1].to(device, non_blocking=True) 
         idx = batch_data[-1]
         
         with autocast():
             logits = model(input) # 形状 [B, 110]
             
-            # =========== [修改开始] 针对不同任务分段计算概率 ===========
-            
-            # 任务1: 阶段 (0-6) -> 假设是单标签互斥任务，使用 Softmax
+            # 任务1: 阶段 (0-6) - Softmax
             logits_phase = logits[:, :7]
             probs_phase = torch.softmax(logits_phase, dim=1)
             
-            # 任务2: Endoscapes (7-9) -> 视具体定义而定，这里假设保持 Sigmoid
+            # 任务2: Endoscapes (7-9) - Sigmoid
             logits_endo = logits[:, 7:10]
             probs_endo = torch.sigmoid(logits_endo)
             
-            # 任务3: 细粒度动作 (10-110) -> 多标签任务，使用 Sigmoid
+            # 任务3: 细粒度动作 (10-110) - Sigmoid
             logits_action = logits[:, 10:]
             probs_action = torch.sigmoid(logits_action)
             
-            # 将三段概率拼接回 [B, 110] 的大矩阵
             probs = torch.cat([probs_phase, probs_endo, probs_action], dim=1)
-            
-            # =========== [修改结束] ===================================
         
         local_preds_list.append(probs)
         local_indices_list.append(idx.to(device))
+        local_targets_list.append(target)
+        
     if len(local_preds_list) > 0:
-            local_probs = torch.cat(local_preds_list, dim=0)      # [N_local, 110]
-            local_indices = torch.cat(local_indices_list, dim=0)  # [N_local]
+        local_probs = torch.cat(local_preds_list, dim=0)      # [N_local, 110]
+        local_indices = torch.cat(local_indices_list, dim=0)  # [N_local]
+        local_targets = torch.cat(local_targets_list, dim=0)  # [N_local, 110]
     else:
-            # 防止有些卡分不到数据的情况（虽然很少见）
         return
-    # 2. 全局汇总 (Global Gather) - 仅在 DDP 模式下触发
+
+    # 2. 全局汇总 (Global Gather)
     if dist.is_initialized():
         world_size = dist.get_world_size()
-        
-        # 准备容器接收所有卡的结果
-        # 注意：DDP 要求各卡 Tensor 尺寸一致。DistributedSampler 默认会补齐数据(padding)，所以通常是对齐的。
         gathered_probs = [torch.zeros_like(local_probs) for _ in range(world_size)]
-        
-        # 全局收集预测概率
         dist.all_gather(gathered_probs, local_probs)
-        
-        # 拼接成全局大矩阵 [N_total, C]
         global_probs = torch.cat(gathered_probs, dim=0)
-        
-        # (可选) 如果不仅为了计算阈值，还需要全局去重，可以同时 gather indices
-        # 但为了简化逻辑，我们只用 global_probs 算阈值，更新还是在本地做
-        
     else:
-        # 单卡模式，全局就是本地
         global_probs = local_probs
 
-    # 3. 计算全局动态阈值 (Calculate Global Thresholds)
-    # 转为 numpy 处理排序 (CPU)
+    # 3. 计算全局动态阈值
     global_probs_np = global_probs.float().cpu().numpy()
     num_global_samples = global_probs_np.shape[0]
     num_classes = global_probs_np.shape[1]
     
-    # 全局排序 (Column-wise)
-    # -x 排序等同于 x 降序
+    # 排序
     sorted_global = -np.sort(-global_probs_np, axis=0)
     
-    # 计算截断位置 (Global Cutoff)
-    # Formula: 总样本数 * 真实分布频率 * 缩放系数
+    # 计算截断
     cutoff_indices = np.floor(pos_freq * num_global_samples * ratio).astype(int)
     cutoff_indices = np.clip(cutoff_indices - 1, 0, num_global_samples - 1)
     
-    # 得到每个类别的阈值向量 [C]
     thresholds = sorted_global[cutoff_indices, range(num_classes)]
     
-    # 打印一下阈值信息，看看有没有离谱的
     if dist.is_initialized() and dist.get_rank() == 0:
         logger.info(f"[CAP] Global Thresholds - Max: {thresholds.max():.4f}, Min: {thresholds.min():.4f}, Mean: {thresholds.mean():.4f}")
 
-    # 4. 本地生成伪标签 (Local Assignment)
-    # 使用全局统一的 thresholds 对 本地数据 进行判定
-    # 必须转回 numpy 进行比较 (因为 thresholds 是 numpy)
+    # 4. 本地生成伪标签
     local_probs_np = local_probs.float().cpu().numpy()
-    
-    # 生成伪标签 (大于全局阈值即为 1)
     pseudo_labels = (local_probs_np >= thresholds).astype(np.float32)
     
+    # ===============================================================
+    # [新增功能] 统计每个类别新增了多少正样本 (全量打印)
+    # ===============================================================
+    local_targets_np = local_targets.float().cpu().numpy()
+    
+    # 逻辑：新标签是1 且 旧标签是0
+    added_mask = np.logical_and(pseudo_labels == 1, local_targets_np == 0)
+    local_added_counts = added_mask.sum(axis=0) # 形状 [110]
+    
+    # 转回 Tensor 以便在多卡间求和
+    added_counts_tensor = torch.from_numpy(local_added_counts).to(device)
+    
+    # 如果是 DDP，把所有卡的增量加起来
+    if dist.is_initialized():
+        dist.all_reduce(added_counts_tensor, op=dist.ReduceOp.SUM)
+    
+    # 仅主进程打印日志
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        final_counts = added_counts_tensor.cpu().numpy().astype(int)
+        total_new = final_counts.sum()
+        
+        logger.info(f"====== [CAP Stats] Total New Pseudo Positives: {total_new} ======")
+        
+        # 构建包含所有类别统计信息的长字符串
+        # 格式: C0:5 C1:0 C2:12 ...
+        stats_str_list = [f"C{c}:{count}" for c, count in enumerate(final_counts)]
+        
+        # 为了阅读方便，每行打印10个类别，但通过拼接字符串的方式确保完整输出
+        chunk_size = 10
+        for i in range(0, num_classes, chunk_size):
+            chunk = stats_str_list[i:i+chunk_size]
+            logger.info(" ".join(chunk))
+            
+        logger.info("================================================================")
+    # ===============================================================
+
     # 5. 本地更新 Dataset
-    # 只需要更新自己手里的这一部分数据，index 是绝对对齐的
     local_indices_np = local_indices.cpu().numpy()
     
     if hasattr(loader.dataset, 'update_labels'):
@@ -517,5 +531,4 @@ def run_cap_procedure(trainer, loader, pos_freq, device, ratio=1.0):
         logger.warning("[CAP] Dataset missing 'update_labels'. Skipped.")
 
     model.train()
-    # 同步结束
     if dist.is_initialized(): dist.barrier()
