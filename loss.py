@@ -1251,3 +1251,50 @@ class BBAMLossVisual(nn.Module):
 
         return loss.sum(), targets
    
+class GCELoss(nn.Module):
+    def __init__(self, q=0.7, num_classes=110):
+        super(GCELoss, self).__init__()
+        self.q = q
+
+    def forward(self, logits, targets, epoch):
+        # 计算概率 (logits -> sigmoid)
+        p = torch.sigmoid(logits)
+        
+        # 构造 "p_true"：
+        # 如果 target=1 (含伪标签), 我们看模型预测正类的概率 p
+        # 如果 target=0 (负样本), 我们看模型预测负类的概率 1-p
+        p_true = p * targets + (1 - p) * (1 - targets)
+        
+        # 截断防止数值错误
+        p_true = torch.clamp(p_true, min=1e-7, max=1.0)
+        
+        # GCE 公式: (1 - p^q) / q
+        loss = (1.0 - torch.pow(p_true, self.q)) / self.q
+        
+        return loss.sum(), targets
+    
+class SCELoss(nn.Module):
+    def __init__(self, alpha=1.0, beta=1.0, num_classes=110):
+        super(SCELoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, logits, targets, epoch):
+        """
+        logits: (Batch, Num_Classes) - 未经过 Sigmoid 的输出
+        targets: (Batch, Num_Classes) - 0/1 标签 (包含伪标签)
+        """
+        # 1. CE 部分 (注重收敛)
+        ce_loss = self.bce(logits, targets)
+
+        # 2. RCE 部分 (注重抗噪)
+        # 在多标签/二分类场景下，RCE 通常用 MAE (Mean Absolute Error) 近似替代
+        # 以避免 log(0) 的数值问题，同时保持对噪声的鲁棒性（梯度有界）
+        pred = torch.sigmoid(logits)
+        mae_loss = torch.abs(pred - targets)
+
+        # 3. 组合
+        loss = self.alpha * ce_loss + self.beta * mae_loss
+
+        return loss.sum(), targets

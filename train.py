@@ -22,7 +22,7 @@ import ivtmetrics
 from log import logger
 from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
-    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual
+    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss
 )
 from mmlsurgadapt import MMLSurgAdaptTrainer
 from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure
@@ -305,7 +305,9 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
         'ASL': lambda: AsymmetricLossOptimized(gamma_neg=4, gamma_pos=0, clip=0.05),
         'WAN': WAN, 'VLPL_Loss': VLPL_Loss, 'Modified_VLPL': Modified_VLPL, 'iWAN': iWAN,
         'G-AN': G_AN, 'LL-R': lambda: LL(scheme='LL-R'), 'LL-Ct': LL,
-        'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss , 'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5)
+        'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss , 'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
+        'GCE': lambda: GCELoss(q=0.7),
+        'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
     if torch.cuda.is_available():
@@ -464,7 +466,9 @@ def train(trainer, dir) -> None:
         'ASL': lambda: AsymmetricLossOptimized(gamma_neg=4, gamma_pos=0, clip=0.05),
         'WAN': WAN, 'VLPL_Loss': VLPL_Loss, 'Modified_VLPL': Modified_VLPL, 'iWAN': iWAN,
         'G-AN': G_AN, 'LL-R': lambda: LL(scheme='LL-R'), 'LL-Ct': LL, 'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss,
-        'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5)
+        'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
+        'GCE': lambda: GCELoss(q=0.7),
+        'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
         
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()

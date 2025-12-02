@@ -1,0 +1,64 @@
+# Training
+n_ctx: 4
+checkpoint: cholec_vals/surgadapt_cap_gce   # For saving checkpoints
+log_file: surgadapt_cap_gce.txt
+model_name: surgadapt_gcn_cap_gce
+batch_size: 39
+lr: 1e-5
+epochs: 20
+reweight_p: 0.2
+relation_file: cholec/word2vec_similarity_matrix.npy
+ratio: 1
+#parent_n_ctx: 4
+#parent_ctx_init: a photo of a
+child_n_ctx: 4
+child_ctx_init: a photo of
+
+# --- Loss & Warmup Configuration ---
+change_epoch: 1 # SPLC 或其他 Loss 的 Warmup epoch
+tau: 0.6        # SPLC 的阈值 (如果使用 SPLC)
+
+# [建议] 关于 Loss 的选择：
+# 1. ASL: CAP 论文原配 Loss，处理正负样本不平衡效果最好。
+# 2. SPLC: 可以结合 CAP。CAP 负责找回假阴性，SPLC 负责加 Margin 提升鲁棒性。
+# 3. Hill: 您原本的 Loss，也可以直接兼容 CAP。
+loss : GCE      # 当前保持 Hill，想换可以改为 'ASL' 或 'SPLC'
+
+image_size: 224
+num_classes: 110
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+child_num: 110
+label_file: label_jsons/data1.json  # Label file for initialization
+val_sp : True # If single positive validation
+val_methods : ['pp_map', 'pp_loss', 'sp_loss'] # Methods for saving loss
+perform_init : False  # Perform model initialization with triplet pseudolabels
+init_train_file : triplet_train_labels.json # Init labels
+init_val_file : triplet_val_labels.json # Init labels
+init_epochs : 5
+init_lr : 1e-5
+dir : trial_surgadapt_cap_gce  # Directory to save results
+
+use_lfile : False  # If use label file
+getitem : False # If call random in getitem
+# Random in init if both false
+backbone : ViT-L/14
+seed: 0  # Set seed
+partial: True # For partial positive data in training
+model: SurgAdapt
+#bert_path : /home/swalimbe/surgvlp_trial/Bio_ClinicalBERT  # Bert init for SurgVLP
+#vlp_weights : /home/swalimbe/surgvlp_trial/nips_v1.tar # Ckpt for SurgVLP
+
+# --- [NEW] CAP Configuration ---
+# 开启类别感知伪标签 (Class-Aware Pseudo-Labeling)
+use_cap: True         
+# CAP 开始介入的 Epoch。建议设为 3-5，让模型先通过原始标签学一点特征。
+# 必须 >= 0。如果想一开始就用，设为 0 (但不推荐)。
+cap_start_epoch: 4  
+cap_ratio: 0.5 
+# accumulation_steps: 1 # 如果显存不够，可以在这里设置梯度累积步数
+
+# Testing
+ckpt: temp.ckpt  # Ckpt path for inference
+test_dir: trial_test_surgadapt_cap_gce # Directory to save results
+test_loss: GCE  # Loss function
