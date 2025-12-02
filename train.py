@@ -479,7 +479,9 @@ def train(trainer, dir) -> None:
     
     parameters = add_weight_decay(trainer.model, cfg.weight_decay)
     optimizer = torch.optim.Adam(params=parameters, lr=cfg.lr, weight_decay=0)
-    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=cfg.epochs, eta_min=1e-6
+)
     steps_per_epoch = len(trainer.train_loader)
     highest_mAP = 0
     min_pp_loss = float('inf')
@@ -648,7 +650,7 @@ def train(trainer, dir) -> None:
                     format(evals['sp_loss'], min_sp_loss, best_epoch_sp, evals["sp_loss_if_better"]))
             
         trainer.model.train()
-
+        scheduler.step()
 def test(trainer, dir) -> None:
     if not is_main_process():
         # 测试阶段非主进程直接退出，但在退出前最好等待一下
