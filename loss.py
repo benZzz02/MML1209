@@ -1298,3 +1298,58 @@ class SCELoss(nn.Module):
         loss = self.alpha * ce_loss + self.beta * mae_loss
 
         return loss.sum(), targets
+    
+
+class WarmupGCELoss(nn.Module):
+    """
+    Warmup 阶段使用 Hill Loss，之后切换到 GCE Loss
+    """
+    def __init__(
+        self, 
+        q: float = 0.7,
+        warmup_epoch: int = 5,  # warmup 结束的 epoch
+        # Hill 参数
+        lamb: float = 1.5, 
+        margin: float = 1.0, 
+        gamma: float = 2.0,
+    ) -> None:
+        super(WarmupGCELoss, self).__init__()
+        self.q = q
+        self.warmup_epoch = warmup_epoch
+        
+        # Hill Loss 参数
+        self.lamb = lamb
+        self.margin = margin
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch. Tensor, epoch: int):
+        
+        if epoch < self.warmup_epoch:
+            # ========== Warmup: Hill Loss ==========
+            logits_margin = logits - self.margin
+            pred_pos = torch.sigmoid(logits_margin)
+            pred_neg = torch. sigmoid(logits)
+
+            pt = (1 - pred_pos) * targets + (1 - targets)
+            focal_weight = pt ** self.gamma
+
+            los_pos = targets * torch.log(pred_pos + 1e-7)
+            los_neg = (1 - targets) * -(self.lamb - pred_neg) * pred_neg ** 2
+
+            loss = -(los_pos + los_neg)
+            loss *= focal_weight
+
+            return loss.sum(), targets
+        
+        else:
+            # ========== 正式训练: GCE Loss ==========
+            p = torch.sigmoid(logits)
+            
+            # p_true: 正样本看 p，负样本看 1-p
+            p_true = p * targets + (1 - p) * (1 - targets)
+            p_true = torch. clamp(p_true, min=1e-7, max=1.0)
+            
+            # GCE 公式: (1 - p^q) / q
+            loss = (1.0 - torch.pow(p_true, self.q)) / self.q
+            
+            return loss. sum(), targets

@@ -22,7 +22,7 @@ tau: 0.6        # SPLC 的阈值 (如果使用 SPLC)
 # 1. ASL: CAP 论文原配 Loss，处理正负样本不平衡效果最好。
 # 2. SPLC: 可以结合 CAP。CAP 负责找回假阴性，SPLC 负责加 Margin 提升鲁棒性。
 # 3. Hill: 您原本的 Loss，也可以直接兼容 CAP。
-loss : GCE      # 当前保持 Hill，想换可以改为 'ASL' 或 'SPLC'
+loss : Warmup_GCE      # 当前保持 Hill，想换可以改为 'ASL' 或 'SPLC'
 
 image_size: 224
 num_classes: 110
@@ -54,11 +54,12 @@ model: SurgAdapt
 use_cap: True         
 # CAP 开始介入的 Epoch。建议设为 3-5，让模型先通过原始标签学一点特征。
 # 必须 >= 0。如果想一开始就用，设为 0 (但不推荐)。
-cap_start_epoch: 4  
+cap_start_epoch: 5  
 cap_ratio: 0.5 
 # accumulation_steps: 1 # 如果显存不够，可以在这里设置梯度累积步数
 
 # Testing
 ckpt: temp.ckpt  # Ckpt path for inference
 test_dir: trial_test_surgadapt_cap_gce # Directory to save results
-test_loss: GCE  # Loss function
+test_loss: Warmup_GCE  # Loss function
+warmup_epoch: 5

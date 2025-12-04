@@ -22,7 +22,7 @@ import ivtmetrics
 from log import logger
 from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
-    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss
+    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,WarmupGCELoss
 )
 from mmlsurgadapt import MMLSurgAdaptTrainer
 from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure
@@ -308,6 +308,7 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
         'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss , 'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
         'GCE': lambda: GCELoss(q=0.7),
         'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
+        'Warmup_GCE': lambda: WarmupGCELoss(warmup_epoch=cfg.warmup_epoch,lamb=1.5,margin=1.0,gamma=2.0, q=0.7),
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
     if torch.cuda.is_available():
@@ -469,6 +470,7 @@ def train(trainer, dir) -> None:
         'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
         'GCE': lambda: GCELoss(q=0.7),
         'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
+        'Warmup_GCE': lambda: WarmupGCELoss(warmup_epoch=cfg.warmup_epoch,lamb=1.5,margin=1.0,gamma=2.0, q=0.7),
         
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
