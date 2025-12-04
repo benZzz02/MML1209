@@ -1252,23 +1252,32 @@ class BBAMLossVisual(nn.Module):
         return loss.sum(), targets
    
 class GCELoss(nn.Module):
-    def __init__(self, q=0.7, num_classes=110):
+    def __init__(self, q=0.7, warmup_epochs=5):
         super(GCELoss, self).__init__()
         self.q = q
+        self.warmup_epochs = warmup_epochs
+        
+        # [修改] 将 Warmup Loss 改为 Hill
+        # 这里的参数建议和你 yaml 配置里的一致 (lamb=1.5, margin=1.0 等)
+        self.warmup_loss = Hill(lamb=1.5, margin=1.0, gamma=2.0)
+        
+        self.epsilon = 1e-5 
 
     def forward(self, logits, targets, epoch):
-        # 计算概率 (logits -> sigmoid)
+        # --- 阶段 1: Warmup (使用 Hill Loss) ---
+        if epoch < self.warmup_epochs:
+            # Hill Loss 的 forward 需要 epoch 参数，虽然它内部没怎么用，但为了接口一致
+            loss, _ = self.warmup_loss(logits, targets, epoch)
+            return loss, targets
+
+        # --- 阶段 2: Robust Training (切换为 GCE) ---
         p = torch.sigmoid(logits)
         
-        # 构造 "p_true"：
-        # 如果 target=1 (含伪标签), 我们看模型预测正类的概率 p
-        # 如果 target=0 (负样本), 我们看模型预测负类的概率 1-p
+        # 计算 p_true
         p_true = p * targets + (1 - p) * (1 - targets)
+        p_true = p_true + self.epsilon
         
-        # 截断防止数值错误
-        p_true = torch.clamp(p_true, min=1e-7, max=1.0)
-        
-        # GCE 公式: (1 - p^q) / q
+        # GCE 公式
         loss = (1.0 - torch.pow(p_true, self.q)) / self.q
         
         return loss.sum(), targets

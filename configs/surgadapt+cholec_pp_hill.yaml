@@ -1,6 +1,6 @@
 # Training
 n_ctx: 4
-checkpoint: cholec_vals    # For saving checkpoints
+checkpoint: cholec_vals/surgadapt_gcn_hill    # For saving checkpoints
 log_file: surgadapt+cholec.txt
 model_name: surgadapt_gcn
 batch_size: 39
@@ -28,7 +28,7 @@ init_train_file : triplet_train_labels.json # Init labels
 init_val_file : triplet_val_labels.json # Init labels
 init_epochs : 5
 init_lr : 1e-5
-dir : trial  # Directory to save results
+dir : trial_surgadapt_hill  # Directory to save results
 loss : Hill  # Loss function
 use_lfile : False  # If use label file
 getitem : False # If call random in getitem
@@ -43,5 +43,5 @@ model: SurgAdapt
 
 # Testing
 ckpt: temp.ckpt  # Ckpt path for inference
-test_dir: trial_test # Directory to save results
+test_dir: trial_test_surgadapt_hill # Directory to save results
 test_loss: Hill  # Loss function

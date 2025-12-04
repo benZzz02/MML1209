@@ -54,7 +54,7 @@ model: SurgAdapt
 use_cap: True         
 # CAP 开始介入的 Epoch。建议设为 3-5，让模型先通过原始标签学一点特征。
 # 必须 >= 0。如果想一开始就用，设为 0 (但不推荐)。
-cap_start_epoch: 4  
+cap_start_epoch: 5  
 cap_ratio: 0.5 
 # accumulation_steps: 1 # 如果显存不够，可以在这里设置梯度累积步数
 
