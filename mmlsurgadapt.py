@@ -16,7 +16,7 @@ from config import cfg
 from model import (
     load_clip_model, MMLSurgAdapt, Resnet, ViT, CrossModel, CLIP_for_train, VLPL, HSPNet,
     MMLSurgAdaptCoOp, MMLSurgAdaptDualCoOp, MMLSurgAdaptCoCoOp,
-    MMLSurgAdaptCoOpFrozen, MMLSurgAdaptDualCoOpFrozen, MMLSurgAdaptCoCoOpFrozen, CLIP_TextAttention,CLIP_TextAttentionCoOp,CLIPCoOpLoRA
+    MMLSurgAdaptCoOpFrozen, MMLSurgAdaptDualCoOpFrozen, MMLSurgAdaptCoCoOpFrozen, CLIP_TextAttention,CLIP_TextAttentionCoOp,CLIPCoOpLoRA,MMLSurgAdaptSCPNet
 )
 from surgvlp import SurgAVLP, CBertViT
 
@@ -94,6 +94,7 @@ class MMLSurgAdaptTrainer():
         elif model_name == 'CLIP-TextAttention': self.model = CLIP_TextAttention(classnames, clip_model)
         elif model_name == 'CLIP-TextAttention-CoOp': self.model = CLIP_TextAttentionCoOp(classnames, clip_model)
         elif model_name == 'CLIP-CoOp-LoRA': self.model = CLIPCoOpLoRA(classnames, clip_model)
+        elif model_name == 'SCPNet': self.model = MMLSurgAdaptSCPNet(classnames, clip_model)
         
         else:
             raise NameError(f"Model '{model_name}' not recognized.")
