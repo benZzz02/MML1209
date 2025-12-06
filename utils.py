@@ -1,7 +1,7 @@
 import os
 import random
 from copy import deepcopy
-
+import heapq
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
@@ -568,3 +568,85 @@ def run_cap_procedure(trainer, loader, class_ratio, device, ratio=1.0):
     model.train()
     if dist.is_initialized():
         dist. barrier()
+        
+        
+class TopKCheckpointManager(object):
+    def __init__(self, k=3, mode='max', save_dir='checkpoints', metric_name='score'):
+        """
+        Args:
+            k (int): 保存前K个模型
+            mode (str): 'max' (如 mAP) 或 'min' (如 Loss)
+            save_dir (str): 保存路径
+            metric_name (str): 指标名称，用于文件名
+        """
+        self.k = k
+        self.mode = mode
+        self.save_dir = save_dir
+        self.metric_name = metric_name
+        self.top_k = []  # 存储堆元素: (sort_score, epoch, filepath)
+        self.best_paths = [] # 存储路径方便检索
+        
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                os.makedirs(save_dir, exist_ok=True)
+        else:
+            os.makedirs(save_dir, exist_ok=True)
+
+    def update(self, score, epoch, trainer, if_ema_better):
+        """
+        更新 Top-K 堆，如果当前分数足够好，则保存模型并移除最差的模型。
+        """
+        # 仅主进程执行保存操作
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        # 统一转换为最小堆处理：如果是求最大值(max)，存负数；如果是求最小值(min)，存正数
+        # 这样堆顶永远是"最差"的那个（数值最大的那个被淘汰，或者负数最大的那个被淘汰）
+        sort_score = score if self.mode == 'min' else -score
+        
+        # 准备保存逻辑
+        state_dict = trainer.model.module.state_dict() if hasattr(trainer.model, "module") else trainer.model.state_dict()
+        if if_ema_better and hasattr(trainer, 'ema'):
+            state_dict = trainer.ema.module.state_dict() if hasattr(trainer.ema, "module") else trainer.ema.state_dict()
+            
+        filename = f"epoch_{epoch}_{self.metric_name}_{score:.4f}.ckpt"
+        filepath = os.path.join(self.save_dir, filename)
+
+        # 堆未满，直接加入
+        if len(self.top_k) < self.k:
+            heapq.heappush(self.top_k, (-sort_score, epoch, filepath)) # 存入堆时取反sort_score，以便堆顶是"最差"的
+            self.save_checkpoint(state_dict, filepath)
+            self.best_paths.append(filepath)
+            logger.info(f"[{self.metric_name}] Top-K list not full. Added epoch {epoch} (Score: {score:.4f})")
+            return
+
+        # 堆已满，比较当前分数与堆顶（目前TopK里最差的）
+        # 注意：因为我们存的是 -sort_score，堆顶是最小的，也就是 sort_score 最大的，也就是"最差"的
+        worst_neg_score, _, worst_filepath = self.top_k[0]
+        
+        # 检查是否优于最差分数
+        # 我们存的是 -sort_score。如果当前 -sort_score > 堆顶，说明当前更好
+        if (-sort_score) > worst_neg_score:
+            # 弹出最差的
+            heapq.heappop(self.top_k)
+            # 删除旧文件
+            if os.path.exists(worst_filepath):
+                os.remove(worst_filepath)
+                logger.info(f"[{self.metric_name}] Removed old checkpoint: {worst_filepath}")
+            if worst_filepath in self.best_paths:
+                self.best_paths.remove(worst_filepath)
+
+            # 推入新的
+            heapq.heappush(self.top_k, (-sort_score, epoch, filepath))
+            self.save_checkpoint(state_dict, filepath)
+            self.best_paths.append(filepath)
+            logger.info(f"[{self.metric_name}] Updated Top-K. Added epoch {epoch} (Score: {score:.4f})")
+        else:
+            pass
+            # logger.info(f"[{self.metric_name}] Epoch {epoch} (Score: {score:.4f}) did not enter Top-{self.k}")
+
+    def save_checkpoint(self, state_dict, filepath):
+        torch.save(state_dict, filepath)
+
+    def get_paths(self):
+        return self.best_paths

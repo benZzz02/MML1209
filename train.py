@@ -25,7 +25,7 @@ from loss import (
     iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency
 )
 from mmlsurgadapt import MMLSurgAdaptTrainer
-from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure
+from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure,TopKCheckpointManager
 from config import cfg  # isort:skip
 
 # =============================================================================
@@ -235,19 +235,20 @@ def save_results(a, b, c, test, dir, method):
     except Exception as e:
         print(f"Error in saving results : {e}")
 
+# [train.py] 替换原有的 calculate_metrics
 def calculate_metrics(labels, preds, preds_ema, video_ids, test, dir, method=None):
-    if not is_main_process(): return
+    if not is_main_process(): return None, None, None # 修改返回值
 
     labels = np.round(labels)
     datasets = ["cholec80", "endoscapes", "cholect50"]
     a, b, c = None, None, None
 
     for dataset in datasets:
-        print(f"Processing dataset: {dataset}")
+        # print(f"Processing dataset: {dataset}") 
         mask = np.array([dataset in v for v in video_ids])
 
         if not np.any(mask):
-            print(f"No samples for dataset: {dataset}, skipping.")
+            # print(f"No samples for dataset: {dataset}, skipping.")
             continue
 
         filtered_labels = labels[mask]
@@ -265,8 +266,11 @@ def calculate_metrics(labels, preds, preds_ema, video_ids, test, dir, method=Non
     if a and b and c:
         save_results(a, b, c, test, dir, method)
     else:
-        print("Warning: Not all dataset metrics were calculated, skipping result save.")
+        pass
+        # print("Warning: Not all dataset metrics were calculated.")
+    
     print("Calculating metrics done")
+    return a, b, c  # [新增] 返回计算结果
 
 def save_best(trainer, if_ema_better: bool, dir, method) -> None:
     if not is_main_process(): return
@@ -460,75 +464,79 @@ def save_best_init(trainer, if_ema_better, dir):
     else:
         torch.save(state_dict, os.path.join(save_path, 'model-highest.ckpt'))
 
-def train(trainer, dir) -> None:
+# [train.py] 修正后的 train 函数
+def train(trainer, dir) -> list:
+    # 1. 定义损失函数
     loss_dict = {
         'SPLC': SPLC, 'GRLoss': GRLoss, 'Hill': Hill,
         'BCE': lambda: AsymmetricLossOptimized(gamma_neg=0, gamma_pos=0, clip=0),
         'Focal': lambda: AsymmetricLossOptimized(gamma_neg=2, gamma_pos=2, clip=0),
         'ASL': lambda: AsymmetricLossOptimized(gamma_neg=4, gamma_pos=0, clip=0.05),
         'WAN': WAN, 'VLPL_Loss': VLPL_Loss, 'Modified_VLPL': Modified_VLPL, 'iWAN': iWAN,
-        'G-AN': G_AN, 'LL-R': lambda: LL(scheme='LL-R'), 'LL-Ct': LL, 'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss,
-        'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
+        'G-AN': G_AN, 'LL-R': lambda: LL(scheme='LL-R'), 'LL-Ct': LL,
+        'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss , 'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
         'GCE': lambda: GCELoss(q=0.7),
         'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
         'Hill_Consistency': Hill_Consistency,
         'SPLC_Consistency': SPLC_Consistency,
-        
     }
-    criterion = loss_dict.get(cfg.loss, lambda: None)()
+    
+    # 添加防错检查
+    criterion_fn = loss_dict.get(cfg.loss, lambda: None)
+    criterion = criterion_fn()
+    
+    if criterion is None:
+        # 如果配置的 loss 名字不对，这里会报错提示
+        raise ValueError(f"Loss function '{cfg.loss}' not found in loss_dict. Available: {list(loss_dict.keys())}")
+
     if torch.cuda.is_available():
         criterion = criterion.cuda()
+    
     if is_main_process():
         print(f"Using criterion: {criterion}")
     
     parameters = add_weight_decay(trainer.model, cfg.weight_decay)
     optimizer = torch.optim.Adam(params=parameters, lr=cfg.lr, weight_decay=0)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, T_max=cfg.epochs, eta_min=1e-6
-)
-    steps_per_epoch = len(trainer.train_loader)
-    highest_mAP = 0
-    min_pp_loss = float('inf')
-    best_epoch_map = 0
-    best_epoch_pp = 0
-    min_sp_loss = float('inf')
-    best_epoch_sp = 0
-        
-    scaler = GradScaler()
-    # ================= [CAP] 初始化准备 =================
-    # 1. 读取配置开关 (建议在 config.py 或 base.yaml 里加，或者这里给默认值)
-    use_cap = getattr(cfg, 'use_cap', False)
-    cap_start_epoch = getattr(cfg, 'cap_start_epoch', 5) # 建议推迟到 5-8
-    cap_ratio = getattr(cfg, 'cap_ratio', 0.6) # [重要] 默认 0.6，保守策略
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
     
+    # [恢复] 这里定义 steps_per_epoch，用于日志打印
+    steps_per_epoch = len(trainer.train_loader)
+    
+    scaler = GradScaler()
+
+    # --- [Top-K Manager 初始化] ---
+    top_k_num = getattr(cfg, 'top_k', 3)
+    map_manager = TopKCheckpointManager(k=top_k_num, mode='max', save_dir=os.path.join(cfg.checkpoint, f'{dir}/best_map'), metric_name='mAP')
+    pp_loss_manager = TopKCheckpointManager(k=top_k_num, mode='min', save_dir=os.path.join(cfg.checkpoint, f'{dir}/best_pp_loss'), metric_name='PPLoss')
+    sp_loss_manager = TopKCheckpointManager(k=top_k_num, mode='min', save_dir=os.path.join(cfg.checkpoint, f'{dir}/best_sp_loss'), metric_name='SPLoss')
+
+    # CAP 逻辑
+    use_cap = getattr(cfg, 'use_cap', False)
+    cap_start_epoch = getattr(cfg, 'cap_start_epoch', 5)
+    cap_ratio = getattr(cfg, 'cap_ratio', 0.6)
     pos_freq = None
     if use_cap:
         if is_main_process():
-            # 计算先验分布
             pos_freq = estimate_class_distribution(trainer.train_loader.dataset, cfg.num_classes)
-            
-            # DDP 广播 (将 numpy 转 tensor 广播后再转回)
             if dist.is_initialized() and pos_freq is not None:
                 pos_freq_t = torch.from_numpy(pos_freq).cuda()
                 dist.broadcast(pos_freq_t, 0)
         else:
-            # 非主进程接收广播
             if dist.is_initialized():
                 pos_freq_t = torch.zeros(cfg.num_classes).cuda()
                 dist.broadcast(pos_freq_t, 0)
                 pos_freq = pos_freq_t.cpu().numpy()
-    # ====================================================
+
     trainer.model.train()
 
-    # --- Initialization Phase ---
+    # --- Initialization Phase (保持原样) ---
     if cfg.perform_init:
         init_optimizer = torch.optim.Adam(params=parameters, lr=cfg.init_lr, weight_decay=0)
         min_init_loss = float('inf')
         best_epoch_init = 0
-        init_steps_per_epoch = len(trainer.init_train_loader)
+        init_steps = len(trainer.init_train_loader) # 获取 init 步数
         
         for epoch in range(cfg.init_epochs):
-            # DDP Set Epoch
             if hasattr(trainer.init_train_loader, 'sampler') and hasattr(trainer.init_train_loader.sampler, 'set_epoch'):
                  trainer.init_train_loader.sampler.set_epoch(epoch)
 
@@ -543,34 +551,30 @@ def train(trainer, dir) -> None:
                 scaler.step(init_optimizer)
                 scaler.update()
                 trainer.ema.update(trainer.model)
-
+                
+                # 增加 init 阶段日志
                 if i % 100 == 0 and is_main_process():
-                    logger.info('Init Epoch [{}/{}], Step [{}/{}], LR {:.1e}, Loss: {:.4f}'
-                        .format(epoch, cfg.init_epochs, str(i).zfill(3), str(init_steps_per_epoch).zfill(3), cfg.init_lr, loss.item()))
-            
-            min_loss, is_ema_better = init_validate(trainer, epoch)
+                     logger.info('Init Epoch [{}/{}], Step [{}/{}], LR {:.1e}, Loss: {:.4f}'
+                        .format(epoch, cfg.init_epochs, str(i).zfill(3), str(init_steps).zfill(3), cfg.init_lr, loss.item()))
 
+            min_loss, is_ema_better = init_validate(trainer, epoch)
             if is_main_process():
                 if min_loss < min_init_loss:
                     min_init_loss = min_loss
                     best_epoch_init = epoch
                     save_best_init(trainer, is_ema_better, dir)
-                logger.info('current_init_loss = {:.2f}, min_init_loss = {:.2f}, best_epoch={}, is_ema_better={}\n'.
-                    format(min_loss, min_init_loss, best_epoch_init, is_ema_better))
-            
+                logger.info(f'Init: min_loss={min_loss:.2f}, best={min_init_loss:.2f}, epoch={best_epoch_init}')
             trainer.model.train()
         
-        # Reload best init model
         if dist.is_initialized(): dist.barrier()
         if is_main_process():
-            map_location = {'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id}
             path = f"{cfg.checkpoint}/{dir}/init/model-highest.ckpt"
             if os.path.exists(path):
-                state_dict = torch.load(path, map_location=map_location)
+                state_dict = torch.load(path, map_location={'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id})
                 model_to_load = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
                 model_to_load.load_state_dict(state_dict, strict=True)
-                logger.info("Best init model loaded by main process.")
-        if dist.is_initialized(): dist.barrier() # Sync weights implicitly via DDP forward or explicit broadcast if strict, but here just barrier is safe enough if model unwrap used correctly later.
+                logger.info("Best init model loaded.")
+        if dist.is_initialized(): dist.barrier()
         trainer.model.train()
 
     # --- Main Training Phase ---
@@ -578,34 +582,18 @@ def train(trainer, dir) -> None:
     if is_main_process(): logger.info(f"Gradient Accumulation Steps: {accumulation_steps}")
 
     for epoch in range(cfg.epochs):
-        # [DDP] 必须在每个epoch开始前设置随机种子
         if hasattr(trainer.train_loader, 'sampler') and hasattr(trainer.train_loader.sampler, 'set_epoch'):
              trainer.train_loader.sampler.set_epoch(epoch)
 
-    # ================= [CAP] 核心介入 =================
-        # 每个 Epoch 开始前，运行 CAP 更新伪标签
-        # 注意：只在 epoch >= cap_start_epoch 后执行
         if use_cap and epoch >= cap_start_epoch and pos_freq is not None:
              if dist.is_initialized(): dist.barrier()
-             
-             run_cap_procedure(
-                trainer, 
-                trainer.train_loader, 
-                pos_freq, 
-                device=torch.device(f"cuda:{cfg.gpu_id}"),
-                ratio=cap_ratio  # [新增] 传入 ratio
-            )
-             
+             run_cap_procedure(trainer, trainer.train_loader, pos_freq, device=torch.device(f"cuda:{cfg.gpu_id}"), ratio=cap_ratio)
              if dist.is_initialized(): dist.barrier()
-        # ====================================================
     
         optimizer.zero_grad()
         for i, batch_data in enumerate(trainer.train_loader):
-            # 手动解包，取前两个，忽略后面所有的(vid, index)
             input = batch_data[0]
             target = batch_data[1]
-            
-            # 移至 GPU
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
             
@@ -619,65 +607,109 @@ def train(trainer, dir) -> None:
                 optimizer.zero_grad()
                 trainer.ema.update(trainer.model)
             
+            # [恢复] 原始日志格式
             if i % 100 == 0 and is_main_process():
                 log_loss = loss.item() * accumulation_steps
                 logger.info('Epoch [{}/{}], Step [{}/{}], LR {:.1e}, Loss: {:.4f}'
                     .format(epoch, cfg.epochs, str(i).zfill(3), str(steps_per_epoch).zfill(3), cfg.lr, log_loss))
 
-        # Validation (Only Master)
-        evals = validate(trainer, epoch, dir,criterion=criterion)
+        # Validation
+        evals = validate(trainer, epoch, dir, criterion=criterion)
 
         if is_main_process() and evals:
-            # mAP Logic
-            if evals['pp_map'] > highest_mAP:
-                highest_mAP = evals['pp_map']
-                best_epoch_map = epoch
-                save_best(trainer, evals['pp_map_if_better'], dir, 'pp_map')
-            logger.info('current_mAP = {:.2f}, highest_mAP = {:.2f}, best_epoch={}, is_ema_better={}\n'.
-                format(evals['pp_map'], highest_mAP, best_epoch_map, evals['pp_map_if_better']))
+            # 使用 Top-K Manager
+            map_manager.update(evals['pp_map'], epoch, trainer, evals['pp_map_if_better'])
+            pp_loss_manager.update(evals['pp_loss'], epoch, trainer, evals['pp_loss_if_better'])
             
-            # PP Loss Logic
-            if evals['pp_loss'] < min_pp_loss:
-                min_pp_loss = evals['pp_loss']
-                best_epoch_pp = epoch
-                save_best(trainer, evals['pp_loss_if_better'], dir, 'pp_loss')
-            logger.info('current_pp_loss = {:.2f}, min_pp_loss = {:.2f}, best_epoch={}, is_ema_better={}\n'.
-                format(evals['pp_loss'], min_pp_loss, best_epoch_pp, evals['pp_loss_if_better']))
-            
-            # SP Loss Logic
             if cfg.val_sp and 'sp_loss' in evals:
-                if evals['sp_loss'] < min_sp_loss:
-                    min_sp_loss = evals['sp_loss']
-                    best_epoch_sp = epoch
-                    save_best(trainer, evals['sp_loss_if_better'], dir, 'sp_loss')
-                logger.info('current_sp_loss = {:.2f}, min_sp_loss = {:.2f}, best_epoch={}, is_ema_better={}\n'.
-                    format(evals['sp_loss'], min_sp_loss, best_epoch_sp, evals["sp_loss_if_better"]))
-            
+                sp_loss_manager.update(evals['sp_loss'], epoch, trainer, evals['sp_loss_if_better'])
+
+            logger.info(f"Epoch {epoch} metrics: {evals}")
+
         trainer.model.train()
         scheduler.step()
-def test(trainer, dir) -> None:
+
+    # 收集所有需要测试的路径
+    final_test_paths = []
+    if is_main_process():
+        final_test_paths.extend(map_manager.get_paths())
+        final_test_paths.extend(pp_loss_manager.get_paths())
+        if cfg.val_sp:
+            final_test_paths.extend(sp_loss_manager.get_paths())
+        
+        final_test_paths = list(set(final_test_paths))
+        
+    return final_test_paths
+
+def test(trainer, dir, checkpoint_paths=None) -> None:
     if not is_main_process():
-        # 测试阶段非主进程直接退出，但在退出前最好等待一下
         return
 
     logger.info("Starting test phase on single GPU (rank 0)...")
-    for method in cfg.val_methods:
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id}
-        ckpt_path = f"{cfg.checkpoint}/{dir}/{method}/model-highest.ckpt"
+    
+    # 1. 确定要测试的文件列表
+    target_paths = checkpoint_paths if checkpoint_paths else []
+    
+    # 兼容旧模式：如果没传路径，且没有 Top-K 结果，尝试扫描默认目录
+    if not target_paths:
+        logger.info("No specific checkpoints provided. Scanning default metrics folders...")
+        for metric_folder in ['best_map', 'best_pp_loss', 'best_sp_loss']:
+            base_p = os.path.join(cfg.checkpoint, f'{dir}/{metric_folder}')
+            if os.path.exists(base_p):
+                found = [os.path.join(base_p, f) for f in os.listdir(base_p) if f.endswith('.ckpt')]
+                target_paths.extend(found)
+    
+    if not target_paths:
+        logger.warning("No checkpoints found to test!")
+        return
+
+    # 2. 准备测试复用缓存: {epoch_index: (a, b, c)}
+    results_cache = {} 
+    
+    # 按文件名排序，稍微整齐一点
+    target_paths.sort()
+
+    sigmoid = torch.sigmoid
+
+    for ckpt_path in target_paths:
         if not os.path.exists(ckpt_path):
-            logger.warning(f"Checkpoint not found for method '{method}': {ckpt_path}")
+            continue
+            
+        filename = os.path.basename(ckpt_path)
+        # 从文件名提取 method name (例如: epoch_50_mAP_0.88 -> method: epoch_50_mAP_0.88)
+        method_name = filename.replace('.ckpt', '')
+        
+        # 尝试解析 epoch
+        epoch_idx = -1
+        try:
+            parts = filename.split('_')
+            if parts[0] == 'epoch':
+                epoch_idx = int(parts[1])
+        except:
+            pass
+        
+        logger.info(f"--- Processing: {method_name} (Epoch {epoch_idx}) ---")
+
+        # 3. 检查是否已缓存 (复用结果)
+        if epoch_idx != -1 and epoch_idx in results_cache:
+            logger.info(f"Epoch {epoch_idx} already tested. Reusing results for method '{method_name}'...")
+            a, b, c = results_cache[epoch_idx]
+            # 直接保存结果，不运行模型
+            if a and b and c:
+                save_results(a, b, c, True, dir, method=method_name)
             continue
 
+        # 4. 运行完整测试
+        logger.info(f"Loading checkpoint: {ckpt_path} ...")
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id}
         state_dict = torch.load(ckpt_path, map_location=map_location)
         model_to_run = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
         model_to_run.load_state_dict(state_dict, strict=True)
         model_to_run.eval()
 
-        logger.info(f"Start test for method: {method}...")
-
-        sigmoid = torch.sigmoid
         preds, targets, all_vids = [], [], []
         
+        # Test Loop
         for i, (input, target, vid) in enumerate(trainer.test_loader):
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
@@ -691,14 +723,21 @@ def test(trainer, dir) -> None:
         all_labels = np.concatenate(targets, axis=0)
         all_predictions_reg = np.concatenate(preds, axis=0)
         all_vids_np = np.array(all_vids)
-        all_predictions_ema = np.zeros_like(all_predictions_reg) # Placeholder
+        # Test 模式通常没有 EMA 预测，用 reg 占位或全0
+        all_predictions_ema = all_predictions_reg 
         
-        calculate_metrics(all_labels, all_predictions_reg, all_predictions_ema, all_vids_np, True, dir, method)
+        # 5. 计算指标并缓存
+        logger.info("Calculating metrics...")
+        # 注意：calculate_metrics 内部会调用 save_results
+        a, b, c = calculate_metrics(all_labels, all_predictions_reg, all_predictions_ema, all_vids_np, True, dir, method=method_name)
         
-        logger.info(f"Method {method} complete.")
+        if epoch_idx != -1 and a and b and c:
+            results_cache[epoch_idx] = (a, b, c)
+            
+        logger.info(f"Checkpoint {method_name} test complete.")
         logger.info("-----------------------")
         
-    logger.info("Testing done...")
+    logger.info("All tests completed.")
 
 def makedir(dir):
     if not is_main_process(): return
@@ -749,13 +788,15 @@ def main():
             dist.barrier()
     else:
         # 训练模式
-        train(trainer, dir)
+        # [修改] 接收 train 返回的最佳模型列表
+        best_checkpoints = train(trainer, dir)
         
         # 训练结束后同步，确保主卡不还没测完其他卡就退出了
         if is_distributed: 
             dist.barrier()
             
-        test(trainer, dir)
+        # [修改] 将列表传递给 test，避免它去重新扫描文件夹
+        test(trainer, dir, checkpoint_paths=best_checkpoints)
         
         # 再次同步，确保测试结束
         if is_distributed: 
