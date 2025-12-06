@@ -1307,3 +1307,131 @@ class SCELoss(nn.Module):
         loss = self.alpha * ce_loss + self.beta * mae_loss
 
         return loss.sum(), targets
+
+# [loss.py] 添加到文件末尾
+
+# ==============================================================================
+# 1. Hill Loss + Consistency Loss
+# ==============================================================================
+class Hill_Consistency(nn.Module):
+    """
+    Hill Loss 结合一致性正则化 (Consistency Regularization)。
+    
+    参数说明:
+    - lamb (float): Hill Loss 的 lambda 参数，控制对负样本的加权 (默认 1.5)。
+    - margin (float): Hill Loss 的 margin 参数 (默认 1.0)。
+    - gamma (float): Focal 参数，控制难易样本挖掘 (默认 2.0)。
+    - cons_weight (float): 一致性损失的权重系数。建议设为 20.0 或更高，因为 MSE Loss (sum) 的量级通常比分类 Loss 小。
+    - cons_temp (float): 计算一致性时的温度系数 (Scaling Factor)，通常设为 1.0。
+    """
+    def __init__(
+        self,
+        lamb: float = 1.5, 
+        margin: float = 1.0, 
+        gamma: float = 2.0,
+        cons_weight: float = 20.0,   # [关键参数] 一致性损失权重
+        cons_temp: float = 1.0       # [关键参数] 温度系数
+    ) -> None:
+        super(Hill_Consistency, self).__init__()
+        
+        # 基础监督损失 (Hill)
+        # 注意：reduction='sum' 必须显式传递，以确保量级匹配
+        self.loss_sup = Hill(lamb=lamb, margin=margin, gamma=gamma, reduction='sum')
+        
+        # 一致性相关参数
+        self.cons_weight = cons_weight
+        self.cons_temp = cons_temp
+        
+        # [关键] 使用 reduction='sum' 让一致性 Loss 的量级与主 Loss (Hill) 保持在同一水平
+        self.mse = nn.MSELoss(reduction='sum')
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch):
+        """
+        logits: [2*B, C] (训练时包含增强图) 或 [B, C] (测试时)
+        targets: [B, C]
+        """
+        batch_size = targets.shape[0]
+        
+        # --- 1. 自动检测是否包含增强数据 ---
+        if logits.shape[0] == 2 * batch_size:
+            # 拆分 Logits
+            logits_clean = logits[:batch_size] # 原图预测 (Teacher)
+            logits_aug = logits[batch_size:]   # 增强图预测 (Student)
+            
+            # --- 2. 计算一致性损失 ---
+            # 目标：让增强图的预测 (Student) 去逼近原图的预测 (Teacher)
+            # 使用 detach() 阻断 Teacher 的梯度，防止模型坍塌
+            probs_clean = torch.sigmoid(logits_clean / self.cons_temp).detach()
+            probs_aug = torch.sigmoid(logits_aug / self.cons_temp)
+            
+            loss_cons = self.mse(probs_aug, probs_clean) * self.cons_weight
+            
+            # 用于后续计算监督 Loss 的 logits 必须是 clean 版本
+            logits_for_sup = logits_clean
+        else:
+            # 如果没有增强数据 (如验证阶段)，一致性损失为 0
+            loss_cons = 0.0
+            logits_for_sup = logits
+
+        # --- 3. 计算监督损失 (Hill) ---
+        loss_hill, _ = self.loss_sup(logits_for_sup, targets, epoch)
+        
+        # 返回总损失
+        return loss_hill + loss_cons, targets
+
+
+# ==============================================================================
+# 2. SPLC Loss + Consistency Loss
+# ==============================================================================
+class SPLC_Consistency(nn.Module):
+    """
+    SPLC Loss 结合一致性正则化。
+    
+    参数说明:
+    - tau (float): 伪标签阈值 (默认 0.6)。
+    - change_epoch (int): 开始伪标签修正的 Epoch (默认 1)。
+    - margin (float): 正样本 Margin (默认 1.0)。
+    - gamma (float): Focal 参数 (默认 2.0)。
+    - cons_weight (float): 一致性损失权重 (默认 20.0)。
+    """
+    def __init__(
+        self,
+        tau: float = 0.6,
+        change_epoch: int = 1,
+        margin: float = 1.0,
+        gamma: float = 2.0,
+        cons_weight: float = 20.0,
+        cons_temp: float = 1.0
+    ) -> None:
+        super(SPLC_Consistency, self).__init__()
+        
+        # 基础监督损失 (SPLC)
+        # SPLC 内部通常默认就是 sum reduction，如果您的 SPLC 类支持 reduction 参数最好也加上
+        self.loss_sup = SPLC(tau=tau, change_epoch=change_epoch, margin=margin, gamma=gamma)
+        
+        self.cons_weight = cons_weight
+        self.cons_temp = cons_temp
+        self.mse = nn.MSELoss(reduction='sum')
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch):
+        batch_size = targets.shape[0]
+        
+        if logits.shape[0] == 2 * batch_size:
+            logits_clean = logits[:batch_size]
+            logits_aug = logits[batch_size:]
+            
+            probs_clean = torch.sigmoid(logits_clean / self.cons_temp).detach()
+            probs_aug = torch.sigmoid(logits_aug / self.cons_temp)
+            
+            loss_cons = self.mse(probs_aug, probs_clean) * self.cons_weight
+            
+            logits_for_sup = logits_clean
+        else:
+            loss_cons = 0.0
+            logits_for_sup = logits
+
+        # --- 计算监督损失 (SPLC) ---
+        # SPLC 会返回修正后的 targets (伪标签)，需要传递出去
+        loss_splc, targets_new = self.loss_sup(logits_for_sup, targets, epoch)
+        
+        return loss_splc + loss_cons, targets_new

@@ -4,13 +4,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torchvision import models
-
+import torchvision.transforms as T
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from config import cfg
 from log import logger
 from peft import LoraConfig, get_peft_model, TaskType 
-
+import numpy as np
 _tokenizer = _Tokenizer()
 
 def add_lora_to_clip(clip_model: nn.Module):
@@ -1343,32 +1343,51 @@ class CLIP_TextAttentionCoOp(nn.Module):
     
     
     
-# --------------------------------------------------------------------------------
-# 新增类: StructuredPriorPrompter (SPP)
-# --------------------------------------------------------------------------------
+# ==============================================================================
+# 1. GPU 上的批量增强模块 (BatchAugmentation)
+#    用于在 forward 阶段实时生成一致性训练所需的增强视图
+# ==============================================================================
+class BatchAugmentation(nn.Module):
+    def __init__(self, input_size=224):
+        super().__init__()
+        # 定义强增强策略 (SimCLR/MoCo 风格)
+        self.aug = nn.Sequential(
+            T.RandomHorizontalFlip(p=0.5),
+            # 颜色抖动: 亮度、对比度、饱和度、色相
+            T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+            T.RandomGrayscale(p=0.2),
+            # T.RandomErasing(p=0.2), # 可选：随机擦除
+        )
+
+    @torch.no_grad()
+    def forward(self, x):
+        return self.aug(x)
+
+# ==============================================================================
+# 2. 结构化先验提示器 (StructuredPriorPrompter, SPP)
+#    动态构建标签相关性矩阵 A*
+# ==============================================================================
 class StructuredPriorPrompter(nn.Module):
-    
     def __init__(self, classnames, clip_model):
         super().__init__()
         
-        # 从 cfg 中读取参数，如果不存在则使用默认值 (假设 cfg 在此范围内可用)
-        # 注意：这些参数需要在您的配置文件中定义 (top_k, t_smooth)
-        k_top = getattr(cfg, 'top_k', 30) # K 值用于稀疏化
-        s_reweight = getattr(cfg, 'reweight_p', 0.2) # 自循环权重 (1-s)，使用您配置中的 reweight_p
-        t_smooth = getattr(cfg, 't_smooth', 0.07) # 关系矩阵平滑温度 (t)
+        # 从 cfg 读取参数，提供默认值
+        k_top = getattr(cfg, 'top_k', 30) 
+        s_reweight = getattr(cfg, 'reweight_p', 0.2) 
+        t_smooth = getattr(cfg, 't_smooth', 0.07) 
         
-        if hasattr(cfg, 'child_num') and cfg.child_num > 0: classnames = classnames[0:cfg.child_num]
+        if hasattr(cfg, 'child_num') and cfg.child_num > 0: 
+            classnames = classnames[0:cfg.child_num]
         self.n_cls = len(classnames)
         dtype = clip_model.dtype
         
-        # 1. 派生静态标签特征 z_i (使用固定提示模板, Eq. 1)
+        # --- 1. 派生静态标签特征 z_i ---
         template = "a photo of a {}."
-        classnames = [name.replace("_", " ") for name in classnames]
-        prompts = [template.format(name) for name in classnames]
+        classnames_proc = [name.replace("_", " ") for name in classnames]
+        prompts = [template.format(name) for name in classnames_proc]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         
-        # 使用 CLIP 的 TextEncoder 核心组件来获取静态嵌入
-        # 注意：此处使用的 TextEncoder 必须是您 model.py 中定义的 TextEncoder 类
+        # 使用 TextEncoder 获取特征
         text_encoder_core = TextEncoder(clip_model)
         with torch.no_grad():
             static_token_embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
@@ -1379,16 +1398,16 @@ class StructuredPriorPrompter(nn.Module):
         
         z_static = F.normalize(z_static, p=2, dim=-1)
         
-        # 2. 计算初始相关性矩阵 A (Eq. 1)
+        # --- 2. 计算相关性矩阵 A ---
         A = torch.matmul(z_static, z_static.t())
         
-        # 3. 创建稀疏矩阵 A' (Top-K 稀疏化, Eq. 2)
+        # --- 3. 稀疏化 A' ---
         A_cpu = A.cpu()
         _, indices = torch.topk(A_cpu, k_top, dim=1)
         mask = torch.zeros_like(A_cpu, dtype=torch.bool).scatter_(1, indices, True)
         A_sparse = A_cpu.masked_fill(~mask, 0.0).to(A.device)
         
-        # 4. 最终邻接矩阵 A* (归一化和自循环, Eq. 3, 4)
+        # --- 4. 归一化与自循环加权 A* ---
         A_exp = torch.exp(A_sparse / t_smooth)
         A_star_numerator = A_exp.masked_fill(A_sparse <= 0.0, 0.0)
         A_star_denominator = A_star_numerator.sum(dim=1, keepdim=True)
@@ -1397,27 +1416,25 @@ class StructuredPriorPrompter(nn.Module):
         A_star = A_star_normalized.to(A.device)
         dialog = torch.eye(self.n_cls, dtype=torch.bool).to(A.device)
         
-        # 应用自循环 reweighting 逻辑 (使用 cfg.reweight_p)
         A_star[dialog] = 0.0
         A_star = A_star * (1.0 - s_reweight)
         A_star[dialog] = s_reweight 
         
+        # 注册为 buffer，随模型保存且不更新梯度
         self.register_buffer("A_star", A_star)
 
     def forward(self):
         return self.A_star
 
-# --------------------------------------------------------------------------------
-# 2. 新增类: SemanticAssociationModule (SAM)
-#    功能：封装 GCN 层和简单相加残差 (遵循论文 Eq. 6 & 7)
-# --------------------------------------------------------------------------------
+# ==============================================================================
+# 3. 语义关联模块 (SemanticAssociationModule, SAM)
+#    基于 GCN 的特征精炼
+# ==============================================================================
 class SemanticAssociationModule(nn.Module):
-    
     def __init__(self, in_features, out_features):
         super().__init__()
-        # GCN 层数，从 cfg 读取，默认为 3
         num_layers = getattr(cfg, 'gcn_layers', 3)
-        # 参照您原有的 GCN 结构维度（1024 -> 2048 -> 1024）
+        # 中间层维度设为输入维度的2倍 (参考原代码)
         mid_features = in_features * 2 
         
         gcn_layers = nn.ModuleList()
@@ -1435,94 +1452,88 @@ class SemanticAssociationModule(nn.Module):
         self.relu = nn.LeakyReLU(0.2)
         
     def forward(self, H0, A_star):
-        # H0: 初始标签特征 Z (来自 CMP)
         H_l = H0.float()
         
-        # GCN 迭代 (对应论文 Eq. 6)
+        # GCN 迭代
         for i, layer in enumerate(self.gcn_layers):
-            A_star = A_star.to(H_l.device) # 确保 A* 始终在正确的设备上
-            H_l = layer(H_l, A_star) # 使用推导出的 A_star
+            # 确保 A* 与特征在同一设备
+            A_star = A_star.to(H_l.device) 
+            H_l = layer(H_l, A_star)
             if i < len(self.gcn_layers) - 1:
                 H_l = self.relu(H_l) 
                 
-        # 最终残差连接: Z* = H^0 + H^L (简单相加，遵循论文 Eq. 7 的推导)
+        # 残差连接 (Eq. 7)
         Z_star = H0 + H_l
         return Z_star
-    
-    
-    
- # --------------------------------------------------------------------------------
-# 3. 修改 MMLSurgAdapt 类
-# --------------------------------------------------------------------------------
+
+# ==============================================================================
+# 4. [最终模型] MMLSurgAdaptSCPNet
+#    集成了 Prompt Learning, SCPNet (SPP+SAM) 以及 一致性增强 (BatchAugmentation)
+# ==============================================================================
 class MMLSurgAdaptSCPNet(nn.Module):
 
     def __init__(self, classnames, clip_model):
         super().__init__()
+        # 1. 基础组件
         self.prompt_learner = PromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-        # ====================================================================
-        # [SCPNet 核心修改 1]: 替换文件加载和 GCN 定义
-        # 1. SPP: 动态推导关系矩阵 A* (替代了从 cfg.relation_file 加载的步骤)
+        # 2. SCPNet 组件 (SPP & SAM)
         self.spp = StructuredPriorPrompter(classnames, clip_model)
-        self.register_buffer("A_star", self.spp()) 
+        self.register_buffer("A_star", self.spp()) # 缓存 A*
         
-        # 2. SAM: GCN 特征精炼模块
-        feat_dim = clip_model.text_projection.shape[1] 
-        # Note: feat_dim is 1024 for RN50 CLIP, matching original GCN input/output.
+        feat_dim = clip_model.text_projection.shape[1] # 通常为 1024 (RN50) 或 512/768 (ViT)
         self.sam = SemanticAssociationModule(feat_dim, feat_dim)
         
-        # 注意：这里我们移除或忽略了您原代码中复杂的 self.relation 和 self.parent_index 加载逻辑
-        # 因为它们已被 self.A_star 取代，并且其处理逻辑已封装在 SPP 中。
-        # 您原代码中使用的 self.gcn 和 self.split 方法将被 self.sam 取代。
-        # ====================================================================
+        # 3. 一致性增强组件 (新增)
+        self.augmentor = BatchAugmentation()
 
-    def encode_text(self, prompts, tokenized_prompts, text_adapter_func=None):
-        # ... (保留原有的 encode_text 方法)
-        if text_adapter_func is not None:
-            text_features = self.text_encoder(
-                prompts, tokenized_prompts, text_adapter_func
-            )
-        else:
-            text_features = self.text_encoder(
-                prompts, tokenized_prompts
-            )
-        return text_features
-    
     def encode_image(self, image, visual_adapter_func=None):
-        # ... (保留原有的 encode_image 方法)
         if visual_adapter_func is not None:
-            image_features = self.image_encoder(
-                [image.type(self.dtype), visual_adapter_func]
-            )
+             # 兼容适配器逻辑
+            image_features = self.image_encoder([image.type(self.dtype), visual_adapter_func])
         else:
-            image_features = self.image_encoder(
-                image.type(self.dtype)
-            )
+            image_features = self.image_encoder(image.type(self.dtype))
         return image_features
-    
+
     def forward(self, image):
+        # ---------------------------------------------------------
+        # Step 1: 图像处理 (训练时双倍Batch，测试时单倍)
+        # ---------------------------------------------------------
+        if self.training:
+            with torch.no_grad():
+                image_aug = self.augmentor(image)
+            # 拼接: [2B, C, H, W] -> 前半部分 Clean, 后半部分 Aug
+            image_input = torch.cat([image, image_aug], dim=0)
+        else:
+            image_input = image
 
+        # ---------------------------------------------------------
+        # Step 2: 提取图像特征
+        # ---------------------------------------------------------
+        image_features = self.encode_image(image_input)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        # ---------------------------------------------------------
+        # Step 3: 提取并精炼文本特征 (SCPNet核心)
+        # ---------------------------------------------------------
         child_prompts = self.prompt_learner()
-
-        # 1. CMP: 获取初始标签特征 Z (H^0)
-        Z = self.text_encoder(child_prompts,self.tokenized_prompts)
         
-        # 2. SAM: 精炼标签特征 Z* (替代了您原代码中调用 self.gcn 的逻辑)
-        A_star = self.A_star.to(Z.device) # 获取动态推导的关系矩阵
-        text_features = self.sam(Z, A_star) # Z* 成为新的 text_features
+        # A. CMP: 获取初始标签特征 Z (H^0)
+        Z = self.text_encoder(child_prompts, self.tokenized_prompts)
         
-        # 归一化特征
-        text_features = text_features / text_features.norm(dim=-1,
-                                                            keepdim=True)
-        image_features = self.encode_image(image)
-        image_features = image_features / image_features.norm(dim=-1,
-                                                              keepdim=True)
-        # 您原代码使用的固定乘数 10，这里保持一致
+        # B. SAM: 使用 A* 精炼标签特征
+        text_features = self.sam(Z, self.A_star) 
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        
+        # ---------------------------------------------------------
+        # Step 4: 计算 Logits
+        # ---------------------------------------------------------
+        # 输出形状: [2*B, N_cls] (训练时) 或 [B, N_cls] (测试时)
         logits = 10 * image_features @ text_features.t()
+        
         return logits
