@@ -13,4 +13,5 @@ parser.add_argument('-t',
                     action="store_true")
 parser.add_argument('-r', '--round', help='round', default=1, type=int)
 parser.add_argument('--resume', default=False, action='store_true')
+parser.add_argument("--weights", default=None, type=str, help="Path to the specific checkpoint to test")
 args = parser.parse_args()

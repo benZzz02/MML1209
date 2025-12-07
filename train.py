@@ -19,6 +19,7 @@ from sklearn.metrics import f1_score, average_precision_score
 from datetime import timedelta
 # 项目内部模块导入
 import ivtmetrics
+import args
 from log import logger
 from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
@@ -814,7 +815,14 @@ def main():
         logger.info('Init: ' + ('On' if cfg.perform_init else 'Off'))
         
     if cfg.test:
-        test(trainer, dir)
+        if args.weights:
+            # 如果传入了 --weights，就只测这一个
+            target_models = [args.weights]
+            logger.info(f"Testing specified model: {args.weights}")
+        else:
+            # 没传就传空列表，让 test 函数自己去扫描文件夹
+            target_models = []
+        test(trainer, dir, checkpoint_paths=target_models)
         if is_distributed: dist.barrier()
     else:
         # 1. 训练，并获取最佳模型列表
