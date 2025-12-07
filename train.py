@@ -466,41 +466,50 @@ def save_best_init(trainer, if_ema_better, dir):
 
 # [train.py] 修正后的 train 函数
 def train(trainer, dir) -> list:
-    # --- 1. 基础设置 (保持不变) ---
+    # --- 原始设置保持不变 ---
     loss_dict = {
         'SPLC': SPLC, 'GRLoss': GRLoss, 'Hill': Hill,
         'BCE': lambda: AsymmetricLossOptimized(gamma_neg=0, gamma_pos=0, clip=0),
         'Focal': lambda: AsymmetricLossOptimized(gamma_neg=2, gamma_pos=2, clip=0),
         'ASL': lambda: AsymmetricLossOptimized(gamma_neg=4, gamma_pos=0, clip=0.05),
         'WAN': WAN, 'VLPL_Loss': VLPL_Loss, 'Modified_VLPL': Modified_VLPL, 'iWAN': iWAN,
-        'G-AN': G_AN, 'LL-R': lambda: LL(scheme='LL-R'), 'LL-Ct': LL,
-        'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss , 'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
-        'GCE': lambda: GCELoss(q=0.7), 'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
-        'Hill_Consistency': Hill_Consistency, 'SPLC_Consistency': SPLC_Consistency,
+        'G-AN': G_AN, 'LL-R': lambda: LL(scheme='LL-R'), 'LL-Ct': LL, 'Weighted_Hill': Weighted_Hill, 'GPRLoss': GPRLoss,
+        'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
+        'GCE': lambda: GCELoss(q=0.7),
+        'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
+        'Hill_Consistency': Hill_Consistency,
+        'SPLC_Consistency': SPLC_Consistency,
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
-    if criterion is None: raise ValueError(f"Loss {cfg.loss} not found.")
-    if torch.cuda.is_available(): criterion = criterion.cuda()
+    if criterion is None:
+        raise ValueError(f"Loss function '{cfg.loss}' not found.")
+    if torch.cuda.is_available():
+        criterion = criterion.cuda()
+    if is_main_process():
+        print(f"Using criterion: {criterion}")
     
     parameters = add_weight_decay(trainer.model, cfg.weight_decay)
     optimizer = torch.optim.Adam(params=parameters, lr=cfg.lr, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
     scaler = GradScaler()
+    
+    # [恢复] 获取步数用于日志
     steps_per_epoch = len(trainer.train_loader)
+    accumulation_steps = getattr(cfg, 'accumulation_steps', 1)
 
-    # --- [简单粗暴的 Top-K 列表] ---
-    # 直接定义在循环外面，绝对不会丢
-    k_num = getattr(cfg, 'top_k', 3)
+    # --- [Top-K 简单列表] ---
+    top_k_num = getattr(cfg, 'top_k', 3)
     best_map_list = []      # 存 (score, epoch, filepath)
     best_pp_loss_list = []  # 存 (score, epoch, filepath)
     best_sp_loss_list = []  # 存 (score, epoch, filepath)
     
     # 基础保存路径
     save_dir_base = os.path.join(cfg.checkpoint, dir)
-    os.makedirs(save_dir_base, exist_ok=True)
-    # -----------------------------
+    if is_main_process():
+        os.makedirs(save_dir_base, exist_ok=True)
+    # -----------------------
 
-    # CAP & Init (保持原逻辑不变)
+    # CAP 逻辑
     use_cap = getattr(cfg, 'use_cap', False)
     cap_start_epoch = getattr(cfg, 'cap_start_epoch', 5)
     cap_ratio = getattr(cfg, 'cap_ratio', 0.6)
@@ -516,57 +525,69 @@ def train(trainer, dir) -> list:
                 pos_freq_t = torch.zeros(cfg.num_classes).cuda()
                 dist.broadcast(pos_freq_t, 0)
                 pos_freq = pos_freq_t.cpu().numpy()
-
+    
     trainer.model.train()
 
-    # --- Initialization Phase (原样保留) ---
+    # --- Initialization Phase (完全恢复您的代码) ---
     if cfg.perform_init:
         init_optimizer = torch.optim.Adam(params=parameters, lr=cfg.init_lr, weight_decay=0)
         min_init_loss = float('inf')
         best_epoch_init = 0
-        init_steps = len(trainer.init_train_loader)
+        init_steps_per_epoch = len(trainer.init_train_loader)
         
         for epoch in range(cfg.init_epochs):
             if hasattr(trainer.init_train_loader, 'sampler') and hasattr(trainer.init_train_loader.sampler, 'set_epoch'):
                  trainer.init_train_loader.sampler.set_epoch(epoch)
+
             for i, (input, target) in enumerate(trainer.init_train_loader):
                 init_optimizer.zero_grad()
                 target = target.cuda(non_blocking=True)
                 image = input.cuda(non_blocking=True)
-                with autocast(): output = trainer.model(image).float()
+                with autocast():
+                    output = trainer.model(image).float()
                 loss = nn.BCEWithLogitsLoss()(output, target)
                 scaler.scale(loss).backward()
                 scaler.step(init_optimizer)
                 scaler.update()
                 trainer.ema.update(trainer.model)
+
+                # [恢复] 这里的日志格式
                 if i % 100 == 0 and is_main_process():
-                     logger.info('Init Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}'.format(epoch, cfg.init_epochs, i, loss.item()))
+                    logger.info('Init Epoch [{}/{}], Step [{}/{}], LR {:.1e}, Loss: {:.4f}'
+                        .format(epoch, cfg.init_epochs, str(i).zfill(3), str(init_steps_per_epoch).zfill(3), cfg.init_lr, loss.item()))
             
             min_loss, is_ema_better = init_validate(trainer, epoch)
+
             if is_main_process():
                 if min_loss < min_init_loss:
                     min_init_loss = min_loss
                     best_epoch_init = epoch
                     save_best_init(trainer, is_ema_better, dir)
-                logger.info(f'Init: min_loss={min_loss:.2f}, best={min_init_loss:.2f}, epoch={best_epoch_init}')
+                logger.info('current_init_loss = {:.2f}, min_init_loss = {:.2f}, best_epoch={}, is_ema_better={}\n'.
+                    format(min_loss, min_init_loss, best_epoch_init, is_ema_better))
+            
             trainer.model.train()
         
         if dist.is_initialized(): dist.barrier()
         if is_main_process():
+            map_location = {'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id}
             path = f"{cfg.checkpoint}/{dir}/init/model-highest.ckpt"
             if os.path.exists(path):
-                state_dict = torch.load(path, map_location={'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id})
+                state_dict = torch.load(path, map_location=map_location)
                 model_to_load = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
                 model_to_load.load_state_dict(state_dict, strict=True)
-                logger.info("Best init model loaded.")
+                logger.info("Best init model loaded by main process.")
         if dist.is_initialized(): dist.barrier()
         trainer.model.train()
 
-    # --- Main Loop ---
+    # --- Main Training Phase ---
+    if is_main_process(): logger.info(f"Gradient Accumulation Steps: {accumulation_steps}")
+
     for epoch in range(cfg.epochs):
         if hasattr(trainer.train_loader, 'sampler') and hasattr(trainer.train_loader.sampler, 'set_epoch'):
              trainer.train_loader.sampler.set_epoch(epoch)
 
+        # CAP Procedure
         if use_cap and epoch >= cap_start_epoch and pos_freq is not None:
              if dist.is_initialized(): dist.barrier()
              run_cap_procedure(trainer, trainer.train_loader, pos_freq, device=torch.device(f"cuda:{cfg.gpu_id}"), ratio=cap_ratio)
@@ -574,35 +595,36 @@ def train(trainer, dir) -> list:
     
         optimizer.zero_grad()
         for i, batch_data in enumerate(trainer.train_loader):
-            input, target = batch_data[0], batch_data[1]
+            input = batch_data[0]
+            target = batch_data[1]
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
             
             loss = trainer.train(input, target, criterion, epoch, i)
-            loss = loss / getattr(cfg, 'accumulation_steps', 1)
+            loss = loss / accumulation_steps
             scaler.scale(loss).backward()
             
-            if (i + 1) % getattr(cfg, 'accumulation_steps', 1) == 0:
+            if (i + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 trainer.ema.update(trainer.model)
             
+            # [恢复] 严格保留您的日志格式 (含 LR 和 log_loss 计算)
             if i % 100 == 0 and is_main_process():
-                logger.info(f'Epoch [{epoch}/{cfg.epochs}], Step [{i}/{steps_per_epoch}], Loss: {loss.item():.4f}')
+                log_loss = loss.item() * accumulation_steps
+                logger.info('Epoch [{}/{}], Step [{}/{}], LR {:.1e}, Loss: {:.4f}'
+                    .format(epoch, cfg.epochs, str(i).zfill(3), str(steps_per_epoch).zfill(3), cfg.lr, log_loss))
 
         # Validation
         evals = validate(trainer, epoch, dir, criterion=criterion)
 
-        # =========================================================
-        # [简单粗暴的 Top-K 处理]
-        # =========================================================
+        # ================= [Top-K 简单处理逻辑] =================
         if is_main_process() and evals:
-            # 1. 准备数据
             cur_map = evals['pp_map']
             cur_pp_loss = evals['pp_loss']
             
-            # 决定用EMA还是普通模型 (优先看mAP谁高)
+            # 决定使用 EMA 还是 Regular
             use_ema = evals.get('pp_map_if_better', False)
             if use_ema and hasattr(trainer, 'ema'):
                 state_dict = trainer.ema.module.state_dict() if hasattr(trainer.ema, "module") else trainer.ema.state_dict()
@@ -615,76 +637,67 @@ def train(trainer, dir) -> list:
             filename = f"epoch_{epoch}_mAP_{cur_map:.2f}_loss_{cur_pp_loss:.4f}_{suffix}.ckpt"
             filepath = os.path.join(save_dir_base, filename)
             
-            # 2. 检查是否值得保存 (只要能进任意一个榜单就存)
-            # 榜单逻辑：列表不满直接进，满了看是否比最后一名好
+            save_needed = False
             
-            save_flag = False
-            
-            # Check mAP (越大越好)
-            # 临时加进去排序
+            # 1. mAP (Descending)
             best_map_list.append((cur_map, epoch, filepath))
-            best_map_list.sort(key=lambda x: x[0], reverse=True) # 降序：分高的在前
-            
-            # Check PP Loss (越小越好)
+            best_map_list.sort(key=lambda x: x[0], reverse=True)
+            # 如果当前 epoch 在前 K 名，就保存
+            if any(x[1] == epoch for x in best_map_list[:top_k_num]):
+                save_needed = True
+
+            # 2. PP Loss (Ascending)
             best_pp_loss_list.append((cur_pp_loss, epoch, filepath))
-            best_pp_loss_list.sort(key=lambda x: x[0]) # 升序：分低的在前
-            
-            # 检查 SP Loss (如果有)
+            best_pp_loss_list.sort(key=lambda x: x[0])
+            if any(x[1] == epoch for x in best_pp_loss_list[:top_k_num]):
+                save_needed = True
+                
+            # 3. SP Loss (Ascending, optional)
             if cfg.val_sp and 'sp_loss' in evals:
                 best_sp_loss_list.append((evals['sp_loss'], epoch, filepath))
                 best_sp_loss_list.sort(key=lambda x: x[0])
-
-            # 3. 如果当前 epoch 在任何一个榜单的前 K 名，就保存它
-            is_top_map = any(x[1] == epoch for x in best_map_list[:k_num])
-            is_top_pp = any(x[1] == epoch for x in best_pp_loss_list[:k_num])
-            is_top_sp = False
-            if cfg.val_sp and 'sp_loss' in evals:
-                is_top_sp = any(x[1] == epoch for x in best_sp_loss_list[:k_num])
+                if any(x[1] == epoch for x in best_sp_loss_list[:top_k_num]):
+                    save_needed = True
             
-            if is_top_map or is_top_pp or is_top_sp:
+            # 保存文件
+            if save_needed:
                 torch.save(state_dict, filepath)
                 logger.info(f"Saved Top-K model: {filename}")
-                save_flag = True
-            
-            # 4. [清理垃圾]
-            # 收集所有前 K 名的文件路径白名单
-            keep_files = set()
-            keep_files.update([x[2] for x in best_map_list[:k_num]])
-            keep_files.update([x[2] for x in best_pp_loss_list[:k_num]])
+
+            # [清理垃圾]
+            # 计算白名单（所有榜单的前 K 名对应的路径）
+            valid_paths = set()
+            valid_paths.update([x[2] for x in best_map_list[:top_k_num]])
+            valid_paths.update([x[2] for x in best_pp_loss_list[:top_k_num]])
             if cfg.val_sp:
-                keep_files.update([x[2] for x in best_sp_loss_list[:k_num]])
+                valid_paths.update([x[2] for x in best_sp_loss_list[:top_k_num]])
             
-            # 修剪列表 (把第 K 名以后的扔掉)
-            best_map_list = best_map_list[:k_num]
-            best_pp_loss_list = best_pp_loss_list[:k_num]
-            if cfg.val_sp:
-                best_sp_loss_list = best_sp_loss_list[:k_num]
-            
-            # 扫描硬盘，如果有 .ckpt 不在白名单里，直接删
-            # 这样保证文件夹里永远只有最好的那几个
+            # 扫描目录并删除不在白名单里的 .ckpt
             for f in os.listdir(save_dir_base):
-                if f.endswith(".ckpt"):
+                if f.endswith('.ckpt') and "epoch_" in f:
                     full_p = os.path.join(save_dir_base, f)
-                    # 只有当这个文件确实是本次训练产生的文件（防止删错别人的）
-                    # 并且不在保留列表里
-                    if full_p not in keep_files and "epoch_" in f:
+                    if full_p not in valid_paths:
                         try:
                             os.remove(full_p)
-                            logger.info(f"Pruned worse model: {f}")
+                            logger.info(f"Removed worse model: {f}")
                         except: pass
-        # =========================================================
+            
+            # 修剪列表内存
+            best_map_list = best_map_list[:top_k_num]
+            best_pp_loss_list = best_pp_loss_list[:top_k_num]
+            if cfg.val_sp:
+                best_sp_loss_list = best_sp_loss_list[:top_k_num]
 
         trainer.model.train()
         scheduler.step()
 
-    # 返回所有留存的路径给 test
+    # 返回给 test
     final_paths = []
     if is_main_process():
-        # 合并所有列表里的路径
         if best_map_list: final_paths.extend([x[2] for x in best_map_list])
         if best_pp_loss_list: final_paths.extend([x[2] for x in best_pp_loss_list])
         if best_sp_loss_list: final_paths.extend([x[2] for x in best_sp_loss_list])
-        final_paths = list(set(final_paths)) # 去重
+        final_paths = list(set(final_paths))
         
     return final_paths
 
