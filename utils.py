@@ -593,24 +593,28 @@ class TopKCheckpointManager(object):
             os.makedirs(save_dir, exist_ok=True)
 
     def update(self, score, epoch, trainer, if_ema_better):
-        """
-        更新 Top-K 堆，如果当前分数足够好，则保存模型并移除最差的模型。
-        """
-        # 仅主进程执行保存操作
         if dist.is_initialized() and dist.get_rank() != 0:
             return
 
-        # 统一转换为最小堆处理：如果是求最大值(max)，存负数；如果是求最小值(min)，存正数
-        # 这样堆顶永远是"最差"的那个（数值最大的那个被淘汰，或者负数最大的那个被淘汰）
-        sort_score = score if self.mode == 'min' else -score
-        
-        # 准备保存逻辑
-        state_dict = trainer.model.module.state_dict() if hasattr(trainer.model, "module") else trainer.model.state_dict()
+        if self.mode == 'max':
+            sort_score = score 
+        else:
+            sort_score = -score
+
+        # --- [修改开始] 决定权重来源并生成对应的后缀 ---
         if if_ema_better and hasattr(trainer, 'ema'):
             state_dict = trainer.ema.module.state_dict() if hasattr(trainer.ema, "module") else trainer.ema.state_dict()
+            model_type = "ema"
+        else:
+            state_dict = trainer.model.module.state_dict() if hasattr(trainer.model, "module") else trainer.model.state_dict()
+            model_type = "reg"
             
-        filename = f"epoch_{epoch}_{self.metric_name}_{score:.4f}.ckpt"
+        # 在文件名里加上 _ema 或 _reg
+        filename = f"epoch_{epoch}_{self.metric_name}_{score:.4f}_{model_type}.ckpt"
+        # --- [修改结束] ---
+
         filepath = os.path.join(self.save_dir, filename)
+
 
         # 堆未满，直接加入
         if len(self.top_k) < self.k:

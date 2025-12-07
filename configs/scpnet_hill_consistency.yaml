@@ -3,8 +3,8 @@ n_ctx: 4
 checkpoint: cholec_vals/scpnet_hill_consistency  # For saving checkpoints
 log_file: scpnet_hill_consistency.txt
 model_name: scpnet
-batch_size: 15
-accumulation_steps: 4
+batch_size: 16
+accumulation_steps: 2
 lr: 1e-5
 epochs: 15
 reweight_p: 0.2
