@@ -1309,14 +1309,11 @@ class SCELoss(nn.Module):
         return loss.sum(), targets
 
 
-# ==============================================================================
-# Consistency Loss 包装器
-# ==============================================================================
+
 
 from consistency import ConsistencyLoss
 
-
-class Hill_Consistency(nn. Module):
+class Hill_Consistency(nn.Module):
     """
     Hill Loss + Consistency Regularization
     """
@@ -1331,35 +1328,38 @@ class Hill_Consistency(nn. Module):
         super().__init__()
         self.loss_sup = Hill(lamb=lamb, margin=margin, gamma=gamma, reduction='sum')
         self.cons_loss = ConsistencyLoss(weight=cons_weight, temperature=cons_temp)
-        self.cons_weight = cons_weight  # 保留属性供 trainer 检查
+        self.cons_weight = cons_weight
 
-    def forward(
-        self, 
-        logits_clean: torch.Tensor, 
-        logits_aug: torch. Tensor, 
-        targets: torch.Tensor, 
-        epoch: int
-    ):
+    def forward(self, *args):
         """
-        Args:
-            logits_clean: 原图 logits [B, C]
-            logits_aug: 增强图 logits [B, C]，验证时可传 None
-            targets: 标签 [B, C]
-            epoch: 当前 epoch
-        
-        Returns:
-            (total_loss, targets)
+        自动分发接口，兼容训练和验证的不同调用方式。
         """
-        # 计算监督损失（只用原图）
+        if len(args) == 4:
+            # 训练时: trainer 传入 (clean, aug, target, epoch)
+            return self.forward_train(*args)
+        elif len(args) == 3:
+            # 验证时: validate 传入 (logits, target, epoch)
+            return self.forward_val(*args)
+        else:
+            raise TypeError(f"Hill_Consistency expected 3 or 4 arguments, got {len(args)}")
+
+    def forward_train(self, logits_clean, logits_aug, targets, epoch):
+        """ 训练阶段逻辑：计算监督损失 + 一致性损失 """
+        # 1. 监督损失 (使用原图预测)
         loss_hill, _ = self.loss_sup(logits_clean, targets, epoch)
         
-        # 计算一致性损失
-        if logits_aug is not None and self.cons_weight > 0:
-            loss_cons = self. cons_loss(logits_clean, logits_aug)
+        # 2. 一致性损失 (原图 vs 增强图)
+        if self.cons_weight > 0:
+            loss_cons = self.cons_loss(logits_clean, logits_aug)
         else:
             loss_cons = 0.0
-        
+            
         return loss_hill + loss_cons, targets
+
+    def forward_val(self, logits, targets, epoch):
+        """ 验证阶段逻辑：仅计算监督损失 """
+        loss_hill, _ = self.loss_sup(logits, targets, epoch)
+        return loss_hill, targets
 
 
 class SPLC_Consistency(nn.Module):
@@ -1378,27 +1378,31 @@ class SPLC_Consistency(nn.Module):
         super().__init__()
         self.loss_sup = SPLC(tau=tau, change_epoch=change_epoch, margin=margin, gamma=gamma)
         self.cons_loss = ConsistencyLoss(weight=cons_weight, temperature=cons_temp)
-        self. cons_weight = cons_weight
+        self.cons_weight = cons_weight
 
-    def forward(
-        self, 
-        logits_clean: torch.Tensor, 
-        logits_aug: torch. Tensor, 
-        targets: torch.Tensor, 
-        epoch: int
-    ):
+    def forward(self, *args):
         """
-        Args:
-            logits_clean: 原图 logits [B, C]
-            logits_aug: 增强图 logits [B, C]，验证时可传 None
-            targets: 标签 [B, C]
-            epoch: 当前 epoch
+        自动分发接口，兼容训练和验证的不同调用方式。
         """
+        if len(args) == 4:
+            return self.forward_train(*args)
+        elif len(args) == 3:
+            return self.forward_val(*args)
+        else:
+            raise TypeError(f"SPLC_Consistency expected 3 or 4 arguments, got {len(args)}")
+
+    def forward_train(self, logits_clean, logits_aug, targets, epoch):
+        """ 训练阶段逻辑 """
         loss_splc, targets_new = self.loss_sup(logits_clean, targets, epoch)
         
-        if logits_aug is not None and self.cons_weight > 0:
+        if self.cons_weight > 0:
             loss_cons = self.cons_loss(logits_clean, logits_aug)
         else:
             loss_cons = 0.0
         
         return loss_splc + loss_cons, targets_new
+        
+    def forward_val(self, logits, targets, epoch):
+        """ 验证阶段逻辑 """
+        loss_splc, targets_new = self.loss_sup(logits, targets, epoch)
+        return loss_splc, targets_new

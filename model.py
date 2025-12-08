@@ -1502,15 +1502,18 @@ class MMLSurgAdaptSCPNet(nn.Module):
 
     def forward(self, image):
         # ---------------------------------------------------------
-        # Step 1: 图像处理 (训练时双倍Batch，测试时单倍)
+        # [修改] 移除内部的数据增强，因为 Trainer 已经在外部做过增强并拼接了
         # ---------------------------------------------------------
-        if self.training:
-            with torch.no_grad():
-                image_aug = self.augmentor(image)
-            # 拼接: [2B, C, H, W] -> 前半部分 Clean, 后半部分 Aug
-            image_input = torch.cat([image, image_aug], dim=0)
-        else:
-            image_input = image
+        # if self.training:
+        #     with torch.no_grad():
+        #         image_aug = self.augmentor(image)
+        #     # 拼接: [2B, C, H, W] -> 前半部分 Clean, 后半部分 Aug
+        #     image_input = torch.cat([image, image_aug], dim=0)
+        # else:
+        #     image_input = image
+        
+        # 直接使用传入的 image，它可能已经是 [Clean; Aug] 的组合
+        image_input = image 
 
         # ---------------------------------------------------------
         # Step 2: 提取图像特征
@@ -1533,7 +1536,6 @@ class MMLSurgAdaptSCPNet(nn.Module):
         # ---------------------------------------------------------
         # Step 4: 计算 Logits
         # ---------------------------------------------------------
-        # 输出形状: [2*B, N_cls] (训练时) 或 [B, N_cls] (测试时)
         logits = 10 * image_features @ text_features.t()
         
         return logits
