@@ -173,32 +173,36 @@ class MMLSurgAdaptTrainer():
         return image_aug
     
     def train(self, input, target, criterion, epoch, epoch_i) -> torch.Tensor:
-        image = input.cuda(non_blocking=True)
+        image = input. cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         
         need_augmentation = (
             self.use_consistency and 
-            self.model.training and 
+            self.model. training and 
             hasattr(criterion, 'cons_weight') and 
             criterion.cons_weight > 0
         )
         
         if getattr(criterion, 'needs_features', False):
             with autocast():
-                features = self.model_unwrap.image_encoder(image.type(self. model_unwrap.dtype))
+                features = self.model_unwrap.image_encoder(image. type(self.model_unwrap.dtype))
                 features = torch.nn.functional.normalize(features, p=2, dim=-1)
             loss, _ = criterion(features, target, epoch)
             
         else:
             if need_augmentation:
                 image_aug = self._apply_consistency_augmentation(image)
-                combined_image = torch.cat([image, image_aug], dim=0)
                 
+                # ✅ 关键修复：分别前向传播原图和增强图，然后手动拼接
                 with autocast():
-                    output = self.model(combined_image).float()
+                    output_clean = self.model(image). float()      # [B, C]
+                    output_aug = self. model(image_aug).float()    # [B, C]
                 
-                # ✅ 关键修复：获取实际的 batch_size 并传给 criterion
-                actual_batch_size = image.shape[0]  # 原始图像的 batch size
+                # 拼接 logits
+                output = torch.cat([output_clean, output_aug], dim=0)  # [2*B, C]
+                
+                # 传递原始图像的 batch size
+                actual_batch_size = image.shape[0]
                 loss, _ = criterion(output, target, epoch, batch_size=actual_batch_size)
             else:
                 with autocast():

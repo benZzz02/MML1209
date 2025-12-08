@@ -1308,15 +1308,9 @@ class SCELoss(nn.Module):
 
         return loss.sum(), targets
 
-# [loss.py] 添加到文件末尾
 
-# ==============================================================================
-# 1. Hill Loss + Consistency Loss
-# ==============================================================================
+
 class Hill_Consistency(nn.Module):
-    """
-    Hill Loss 结合一致性正则化 (Consistency Regularization)。
-    """
     def __init__(
         self,
         lamb: float = 1.5, 
@@ -1325,57 +1319,52 @@ class Hill_Consistency(nn.Module):
         cons_weight: float = 20.0,
         cons_temp: float = 1.0
     ) -> None:
-        
         super(Hill_Consistency, self).__init__()
-        
         self.loss_sup = Hill(lamb=lamb, margin=margin, gamma=gamma, reduction='sum')
         self.cons_weight = cons_weight
-        self. cons_temp = cons_temp
-        self.mse = nn. MSELoss(reduction='sum')
+        self.cons_temp = cons_temp
+        self.mse = nn.MSELoss(reduction='sum')
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch, batch_size=None):
         """
-        logits: [2*B, C] (训练时包含增强图) 或 [B, C] (测试时)
+        logits: [2*B, C] (训练时) 或 [B, C] (测试时)
         targets: [B, C]
+        batch_size: 显式传入的原始 batch size
         """
-        batch_size = targets.shape[0]
+        if batch_size is None:
+            batch_size = targets.shape[0]
+        
         total_logits = logits.shape[0]
         
-        # --- 1. 检测是否包含增强数据 ---
         if total_logits == 2 * batch_size:
-            # ✅ 正常情况：logits 是 targets 的 2 倍
+            # 正常情况：logits 是 batch_size 的 2 倍
             logits_clean = logits[:batch_size]
             logits_aug = logits[batch_size:]
             
-            # 计算一致性损失
-            probs_clean = torch.sigmoid(logits_clean / self. cons_temp). detach()
+            probs_clean = torch.sigmoid(logits_clean / self.cons_temp). detach()
             probs_aug = torch.sigmoid(logits_aug / self.cons_temp)
             loss_cons = self.mse(probs_aug, probs_clean) * self.cons_weight
             
             logits_for_sup = logits_clean
             
         elif total_logits == batch_size:
-            # ✅ 验证/测试阶段：没有增强数据
+            # 验证/测试阶段
             loss_cons = 0.0
             logits_for_sup = logits
             
         else:
-            # ⚠️ 异常情况：维度不匹配
+            # 异常情况
             print(f"[Warning] Hill_Consistency: logits.shape[0]={total_logits} "
-                  f"doesn't match targets.shape[0]={batch_size} or 2*targets.shape[0]={2*batch_size}")
+                  f"doesn't match batch_size={batch_size} or 2*batch_size={2*batch_size}")
             logits_for_sup = logits[:batch_size]
             loss_cons = 0.0
 
-        # --- 2. 计算监督损失 ---
         loss_hill, _ = self.loss_sup(logits_for_sup, targets, epoch)
         
         return loss_hill + loss_cons, targets
 
 
 class SPLC_Consistency(nn.Module):
-    """
-    SPLC Loss 结合一致性正则化。
-    """
     def __init__(
         self,
         tau: float = 0.6,
@@ -1386,15 +1375,16 @@ class SPLC_Consistency(nn.Module):
         cons_temp: float = 1.0
     ) -> None:
         super(SPLC_Consistency, self).__init__()
-
         self.loss_sup = SPLC(tau=tau, change_epoch=change_epoch, margin=margin, gamma=gamma)
         self.cons_weight = cons_weight
         self.cons_temp = cons_temp
         self.mse = nn.MSELoss(reduction='sum')
 
-    def forward(self, logits: torch.Tensor, targets: torch. Tensor, epoch):
-        batch_size = targets.shape[0]
-        total_logits = logits.shape[0]
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch, batch_size=None):
+        if batch_size is None:
+            batch_size = targets. shape[0]
+        
+        total_logits = logits. shape[0]
         
         if total_logits == 2 * batch_size:
             logits_clean = logits[:batch_size]
@@ -1412,7 +1402,7 @@ class SPLC_Consistency(nn.Module):
             
         else:
             print(f"[Warning] SPLC_Consistency: logits.shape[0]={total_logits} "
-                  f"doesn't match targets.shape[0]={batch_size}")
+                  f"doesn't match batch_size={batch_size}")
             logits_for_sup = logits[:batch_size]
             loss_cons = 0.0
 
