@@ -133,6 +133,11 @@ class MMLSurgAdaptTrainer():
         Returns:
             增强后的图像 tensor [B, C, H, W]
         """
+        # Augmentation constants
+        RGB_TO_GRAY_WEIGHTS = [0.299, 0.587, 0.114]
+        BRIGHTNESS_RANGE = 0.4
+        BRIGHTNESS_MIN = 0.8
+        
         with torch.no_grad():
             # 1. 反归一化到 [0, 1]
             image_denorm = image * self.clip_std + self.clip_mean
@@ -142,24 +147,25 @@ class MMLSurgAdaptTrainer():
             batch_size = image_denorm.shape[0]
             image_aug = image_denorm.clone()
             
-            # 随机水平翻转 (50% 概率)
+            # 随机水平翻转 (50% 概率) - vectorized
             flip_mask = torch.rand(batch_size) < 0.5
-            for i in range(batch_size):
-                if flip_mask[i]:
-                    image_aug[i] = torch.flip(image_aug[i], dims=[2])  # 水平翻转
+            if flip_mask.any():
+                image_aug[flip_mask] = torch.flip(image_aug[flip_mask], dims=[2])
             
             # 随机亮度调整 (范围: 0.8 - 1.2)
-            brightness_factor = torch.rand(batch_size, 1, 1, 1).cuda(self.gpu_id) * 0.4 + 0.8
+            brightness_factor = torch.rand(batch_size, 1, 1, 1).cuda(self.gpu_id) * BRIGHTNESS_RANGE + BRIGHTNESS_MIN
             image_aug = image_aug * brightness_factor
             image_aug = torch.clamp(image_aug, 0, 1)
             
-            # 随机灰度化 (20% 概率)
+            # 随机灰度化 (20% 概率) - vectorized
             gray_mask = torch.rand(batch_size) < 0.2
-            for i in range(batch_size):
-                if gray_mask[i]:
-                    # 转换为灰度图 (保持 3 通道)
-                    gray = 0.299 * image_aug[i, 0] + 0.587 * image_aug[i, 1] + 0.114 * image_aug[i, 2]
-                    image_aug[i] = gray.unsqueeze(0).repeat(3, 1, 1)
+            if gray_mask.any():
+                # 转换为灰度图 (保持 3 通道) - vectorized computation
+                gray = (RGB_TO_GRAY_WEIGHTS[0] * image_aug[:, 0] + 
+                        RGB_TO_GRAY_WEIGHTS[1] * image_aug[:, 1] + 
+                        RGB_TO_GRAY_WEIGHTS[2] * image_aug[:, 2])
+                gray_3ch = gray.unsqueeze(1).repeat(1, 3, 1, 1)
+                image_aug[gray_mask] = gray_3ch[gray_mask]
             
             # 3. 重新归一化
             image_aug = (image_aug - self.clip_mean) / self.clip_std
