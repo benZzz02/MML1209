@@ -50,3 +50,15 @@ test_loss: SPLC_Consistency  # Loss function
 gcn_layers: 3 # [SCPNet SAM] GCN 堆叠层数
 top_k: 10 # [SCPNet SPP] 用于生成稀疏关系矩阵的 Top-K 值
 t_smooth: 0.07 # [SCPNet SPP] 用于关系矩阵归一化的平滑温度（论文 Eq. 4 中的 t）
+
+#Consistency Loss Parameters
+use_consistency: True
+
+# Hill 相关参数
+lamb: 1.5
+margin: 1.0
+gamma: 2.0
+
+# 一致性相关参数
+cons_weight: 20.0
+cons_temp: 1.0
