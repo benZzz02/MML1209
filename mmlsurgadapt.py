@@ -111,9 +111,72 @@ class MMLSurgAdaptTrainer():
         logger.info(f"EMA CO: {ema_co}")
         self.model_unwrap = self.model.module if self.distributed else self.model
         self.ema = ModelEma(self.model_unwrap, ema_co)
+        
+        # [新增] 一致性损失相关配置
+        self.use_consistency = getattr(cfg, 'use_consistency', False)
+        # CLIP 归一化参数 (用于反归一化和重归一化)
+        self.clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1).cuda(self.gpu_id)
+        self.clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1).cuda(self.gpu_id)
+        
+        if self.use_consistency:
+            logger.info("Consistency regularization is ENABLED")
+        else:
+            logger.info("Consistency regularization is DISABLED")
+    
+    def _apply_consistency_augmentation(self, image):
+        """
+        对归一化后的图像应用一致性增强
+        
+        Args:
+            image: 归一化后的图像 tensor [B, C, H, W]
+        
+        Returns:
+            增强后的图像 tensor [B, C, H, W]
+        """
+        with torch.no_grad():
+            # 1. 反归一化到 [0, 1]
+            image_denorm = image * self.clip_std + self.clip_mean
+            image_denorm = torch.clamp(image_denorm, 0, 1)
+            
+            # 2. 应用随机增强
+            batch_size = image_denorm.shape[0]
+            image_aug = image_denorm.clone()
+            
+            # 随机水平翻转 (50% 概率)
+            flip_mask = torch.rand(batch_size) < 0.5
+            for i in range(batch_size):
+                if flip_mask[i]:
+                    image_aug[i] = torch.flip(image_aug[i], dims=[2])  # 水平翻转
+            
+            # 随机亮度调整 (范围: 0.8 - 1.2)
+            brightness_factor = torch.rand(batch_size, 1, 1, 1).cuda(self.gpu_id) * 0.4 + 0.8
+            image_aug = image_aug * brightness_factor
+            image_aug = torch.clamp(image_aug, 0, 1)
+            
+            # 随机灰度化 (20% 概率)
+            gray_mask = torch.rand(batch_size) < 0.2
+            for i in range(batch_size):
+                if gray_mask[i]:
+                    # 转换为灰度图 (保持 3 通道)
+                    gray = 0.299 * image_aug[i, 0] + 0.587 * image_aug[i, 1] + 0.114 * image_aug[i, 2]
+                    image_aug[i] = gray.unsqueeze(0).repeat(3, 1, 1)
+            
+            # 3. 重新归一化
+            image_aug = (image_aug - self.clip_mean) / self.clip_std
+            
+        return image_aug
     
     def train(self, input, target, criterion, epoch, epoch_i) -> torch.Tensor:
         image = input.cuda(non_blocking=True)
+        
+        # [新增] 检查是否需要生成增强数据用于一致性损失
+        # 三个条件：1. use_consistency 开启  2. 训练模式  3. criterion 有 cons_weight 且 > 0
+        need_augmentation = (
+            self.use_consistency and 
+            self.model.training and 
+            hasattr(criterion, 'cons_weight') and 
+            criterion.cons_weight > 0
+        )
         
         # [修改] 智能判断：根据 Loss 的需求决定传什么
         if getattr(criterion, 'needs_features', False):
@@ -130,10 +193,24 @@ class MMLSurgAdaptTrainer():
             loss, _ = criterion(features, target, epoch)
             
         else:
-            # --- 分支 B: 针对普通 Loss (保持原样) ---
-            with autocast():
-                output = self.model(image).float()
-            loss, _ = criterion(output, target, epoch)
+            # --- 分支 B: 针对普通 Loss ---
+            if need_augmentation:
+                # 生成增强图像
+                image_aug = self._apply_consistency_augmentation(image)
+                # 拼接原图和增强图：[2*B, C, H, W]
+                combined_image = torch.cat([image, image_aug], dim=0)
+                
+                with autocast():
+                    # 模型前向传播，得到 [2*B, num_classes] 的输出
+                    output = self.model(combined_image).float()
+                
+                # 损失函数内部会自动检测 logits.shape[0] == 2 * batch_size 并计算一致性损失
+                loss, _ = criterion(output, target, epoch)
+            else:
+                # 不需要增强，正常前向传播
+                with autocast():
+                    output = self.model(image).float()
+                loss, _ = criterion(output, target, epoch)
             
         return loss
 

@@ -313,8 +313,21 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
         'Weighted_Hill': Weighted_Hill,'GPRLoss': GPRLoss , 'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
         'GCE': lambda: GCELoss(q=0.7),
         'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
-        'Hill_Consistency': Hill_Consistency,
-        'SPLC_Consistency': SPLC_Consistency,
+        'Hill_Consistency': lambda: Hill_Consistency(
+            lamb=getattr(cfg, 'lamb', 1.5),
+            margin=getattr(cfg, 'margin', 1.0),
+            gamma=getattr(cfg, 'gamma', 2.0),
+            cons_weight=getattr(cfg, 'cons_weight', 20.0),
+            cons_temp=getattr(cfg, 'cons_temp', 1.0)
+        ),
+        'SPLC_Consistency': lambda: SPLC_Consistency(
+            tau=getattr(cfg, 'tau', 0.6),
+            change_epoch=getattr(cfg, 'change_epoch', 1),
+            margin=getattr(cfg, 'margin', 1.0),
+            gamma=getattr(cfg, 'gamma', 2.0),
+            cons_weight=getattr(cfg, 'cons_weight', 20.0),
+            cons_temp=getattr(cfg, 'cons_temp', 1.0)
+        ),
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
     if torch.cuda.is_available():
@@ -478,8 +491,21 @@ def train(trainer, dir) -> list:
         'BBAM': lambda: BBAMLossVisual(num_classes=cfg.num_classes, s=10.0, m=0.4, start_epoch=5),
         'GCE': lambda: GCELoss(q=0.7),
         'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
-        'Hill_Consistency': Hill_Consistency,
-        'SPLC_Consistency': SPLC_Consistency,
+        'Hill_Consistency': lambda: Hill_Consistency(
+            lamb=getattr(cfg, 'lamb', 1.5),
+            margin=getattr(cfg, 'margin', 1.0),
+            gamma=getattr(cfg, 'gamma', 2.0),
+            cons_weight=getattr(cfg, 'cons_weight', 20.0),
+            cons_temp=getattr(cfg, 'cons_temp', 1.0)
+        ),
+        'SPLC_Consistency': lambda: SPLC_Consistency(
+            tau=getattr(cfg, 'tau', 0.6),
+            change_epoch=getattr(cfg, 'change_epoch', 1),
+            margin=getattr(cfg, 'margin', 1.0),
+            gamma=getattr(cfg, 'gamma', 2.0),
+            cons_weight=getattr(cfg, 'cons_weight', 20.0),
+            cons_temp=getattr(cfg, 'cons_temp', 1.0)
+        ),
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
     if criterion is None:
