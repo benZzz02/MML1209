@@ -60,5 +60,5 @@ margin: 1.0
 gamma: 2.0
 
 # 一致性相关参数
-cons_weight: 20.0
-cons_temp: 1.0
+cons_weight: 50.0
+cons_temp: 2.0

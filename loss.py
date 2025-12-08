@@ -1351,6 +1351,9 @@ class Hill_Consistency(nn.Module):
         # 2. 一致性损失 (原图 vs 增强图)
         if self.cons_weight > 0:
             loss_cons = self.cons_loss(logits_clean, logits_aug)
+            ###if not dist.is_initialized() or dist.get_rank() == 0:
+                # 打印格式：[Debug] Epoch X | Cons Loss: X.XXXX | Sup Loss: X.XXXX
+                ###print(f"\n[Debug] Epoch {epoch} | Cons Loss: {loss_cons.item():.6f} | Sup Loss: {loss_hill.item():.6f}")
         else:
             loss_cons = 0.0
             
