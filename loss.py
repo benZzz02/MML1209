@@ -1309,8 +1309,17 @@ class SCELoss(nn.Module):
         return loss.sum(), targets
 
 
+# ==============================================================================
+# Consistency Loss 包装器
+# ==============================================================================
 
-class Hill_Consistency(nn.Module):
+from consistency import ConsistencyLoss
+
+
+class Hill_Consistency(nn. Module):
+    """
+    Hill Loss + Consistency Regularization
+    """
     def __init__(
         self,
         lamb: float = 1.5, 
@@ -1319,52 +1328,44 @@ class Hill_Consistency(nn.Module):
         cons_weight: float = 20.0,
         cons_temp: float = 1.0
     ) -> None:
-        super(Hill_Consistency, self).__init__()
+        super().__init__()
         self.loss_sup = Hill(lamb=lamb, margin=margin, gamma=gamma, reduction='sum')
-        self.cons_weight = cons_weight
-        self.cons_temp = cons_temp
-        self.mse = nn.MSELoss(reduction='sum')
+        self.cons_loss = ConsistencyLoss(weight=cons_weight, temperature=cons_temp)
+        self.cons_weight = cons_weight  # 保留属性供 trainer 检查
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch, batch_size=None):
+    def forward(
+        self, 
+        logits_clean: torch.Tensor, 
+        logits_aug: torch. Tensor, 
+        targets: torch.Tensor, 
+        epoch: int
+    ):
         """
-        logits: [2*B, C] (训练时) 或 [B, C] (测试时)
-        targets: [B, C]
-        batch_size: 显式传入的原始 batch size
+        Args:
+            logits_clean: 原图 logits [B, C]
+            logits_aug: 增强图 logits [B, C]，验证时可传 None
+            targets: 标签 [B, C]
+            epoch: 当前 epoch
+        
+        Returns:
+            (total_loss, targets)
         """
-        if batch_size is None:
-            batch_size = targets.shape[0]
+        # 计算监督损失（只用原图）
+        loss_hill, _ = self.loss_sup(logits_clean, targets, epoch)
         
-        total_logits = logits.shape[0]
-        
-        if total_logits == 2 * batch_size:
-            # 正常情况：logits 是 batch_size 的 2 倍
-            logits_clean = logits[:batch_size]
-            logits_aug = logits[batch_size:]
-            
-            probs_clean = torch.sigmoid(logits_clean / self.cons_temp). detach()
-            probs_aug = torch.sigmoid(logits_aug / self.cons_temp)
-            loss_cons = self.mse(probs_aug, probs_clean) * self.cons_weight
-            
-            logits_for_sup = logits_clean
-            
-        elif total_logits == batch_size:
-            # 验证/测试阶段
-            loss_cons = 0.0
-            logits_for_sup = logits
-            
+        # 计算一致性损失
+        if logits_aug is not None and self.cons_weight > 0:
+            loss_cons = self. cons_loss(logits_clean, logits_aug)
         else:
-            # 异常情况
-            print(f"[Warning] Hill_Consistency: logits.shape[0]={total_logits} "
-                  f"doesn't match batch_size={batch_size} or 2*batch_size={2*batch_size}")
-            logits_for_sup = logits[:batch_size]
             loss_cons = 0.0
-
-        loss_hill, _ = self.loss_sup(logits_for_sup, targets, epoch)
         
         return loss_hill + loss_cons, targets
 
 
 class SPLC_Consistency(nn.Module):
+    """
+    SPLC Loss + Consistency Regularization
+    """
     def __init__(
         self,
         tau: float = 0.6,
@@ -1374,38 +1375,30 @@ class SPLC_Consistency(nn.Module):
         cons_weight: float = 20.0,
         cons_temp: float = 1.0
     ) -> None:
-        super(SPLC_Consistency, self).__init__()
+        super().__init__()
         self.loss_sup = SPLC(tau=tau, change_epoch=change_epoch, margin=margin, gamma=gamma)
-        self.cons_weight = cons_weight
-        self.cons_temp = cons_temp
-        self.mse = nn.MSELoss(reduction='sum')
+        self.cons_loss = ConsistencyLoss(weight=cons_weight, temperature=cons_temp)
+        self. cons_weight = cons_weight
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, epoch, batch_size=None):
-        if batch_size is None:
-            batch_size = targets. shape[0]
+    def forward(
+        self, 
+        logits_clean: torch.Tensor, 
+        logits_aug: torch. Tensor, 
+        targets: torch.Tensor, 
+        epoch: int
+    ):
+        """
+        Args:
+            logits_clean: 原图 logits [B, C]
+            logits_aug: 增强图 logits [B, C]，验证时可传 None
+            targets: 标签 [B, C]
+            epoch: 当前 epoch
+        """
+        loss_splc, targets_new = self.loss_sup(logits_clean, targets, epoch)
         
-        total_logits = logits. shape[0]
-        
-        if total_logits == 2 * batch_size:
-            logits_clean = logits[:batch_size]
-            logits_aug = logits[batch_size:]
-            
-            probs_clean = torch.sigmoid(logits_clean / self. cons_temp).detach()
-            probs_aug = torch. sigmoid(logits_aug / self.cons_temp)
-            loss_cons = self.mse(probs_aug, probs_clean) * self.cons_weight
-            
-            logits_for_sup = logits_clean
-            
-        elif total_logits == batch_size:
-            loss_cons = 0.0
-            logits_for_sup = logits
-            
+        if logits_aug is not None and self.cons_weight > 0:
+            loss_cons = self.cons_loss(logits_clean, logits_aug)
         else:
-            print(f"[Warning] SPLC_Consistency: logits.shape[0]={total_logits} "
-                  f"doesn't match batch_size={batch_size}")
-            logits_for_sup = logits[:batch_size]
             loss_cons = 0.0
-
-        loss_splc, targets_new = self.loss_sup(logits_for_sup, targets, epoch)
         
         return loss_splc + loss_cons, targets_new
