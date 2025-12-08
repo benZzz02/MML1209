@@ -32,14 +32,12 @@ class MMLSurgAdaptTrainer():
         train_preprocess = transforms.Compose([
             transforms.Resize((image_size,image_size), interpolation=InterpolationMode.BICUBIC),
             transforms.ToTensor(),
-            transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
-                                 (0.26862954, 0.26130258, 0.27577711)),
+            transforms.Normalize((0.48145466, 0.4578275, 0.40821073),(0.26862954, 0.26130258, 0.27577711)),
         ])
         val_preprocess = transforms.Compose([
             transforms.Resize((image_size,image_size), interpolation=InterpolationMode.BICUBIC),
             transforms.ToTensor(),
-            transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
-                                 (0.26862954, 0.26130258, 0.27577711)),
+            transforms.Normalize((0.48145466, 0.4578275, 0.40821073),(0.26862954, 0.26130258, 0.27577711)),
         ])
         
         if cfg.perform_init:
@@ -84,12 +82,11 @@ class MMLSurgAdaptTrainer():
         elif model_name == 'SurgAdapt-CoOp': self.model = MMLSurgAdaptCoOp(classnames, clip_model)
         elif model_name == 'SurgAdapt-DualCoOp': self.model = MMLSurgAdaptDualCoOp(classnames, clip_model)
         elif model_name == 'SurgAdapt-CoCoOp': self.model = MMLSurgAdaptCoCoOp(classnames, clip_model)
-       
         # CoOp 变体 (冻结骨干)
         elif model_name == 'SurgAdapt-CoOp-Frozen': self.model = MMLSurgAdaptCoOpFrozen(classnames, clip_model)
         elif model_name == 'SurgAdapt-DualCoOp-Frozen': self.model = MMLSurgAdaptDualCoOpFrozen(classnames, clip_model)
         elif model_name == 'SurgAdapt-CoCoOp-Frozen': self.model = MMLSurgAdaptCoCoOpFrozen(classnames, clip_model)
-        elif model_name == 'SurgAdapt-CoOp-VisualFrozen': self.model = MMLSurgAdaptCoOpVisualFrozen(classnames, clip_model)
+        #elif model_name == 'SurgAdapt-CoOp-VisualFrozen': self.model = MMLSurgAdaptCoOpVisualFrozen(classnames, clip_model)
         
         elif model_name == 'CLIP-TextAttention': self.model = CLIP_TextAttention(classnames, clip_model)
         elif model_name == 'CLIP-TextAttention-CoOp': self.model = CLIP_TextAttentionCoOp(classnames, clip_model)
@@ -133,11 +130,10 @@ class MMLSurgAdaptTrainer():
         Returns:
             增强后的图像 tensor [B, C, H, W]
         """
-        # Augmentation constants
         RGB_TO_GRAY_WEIGHTS = [0.299, 0.587, 0.114]
         BRIGHTNESS_RANGE = 0.4
         BRIGHTNESS_MIN = 0.8
-        
+    
         with torch.no_grad():
             # 1. 反归一化到 [0, 1]
             image_denorm = image * self.clip_std + self.clip_mean
@@ -145,27 +141,31 @@ class MMLSurgAdaptTrainer():
             
             # 2. 应用随机增强
             batch_size = image_denorm.shape[0]
+            device = image.device  # ✅ 获取正确的设备
             image_aug = image_denorm.clone()
             
-            # 随机水平翻转 (50% 概率) - vectorized
-            flip_mask = torch.rand(batch_size) < 0.5
+            # 随机水平翻转 (50% 概率)
+            flip_mask = torch.rand(batch_size, device=device) < 0.5  # ✅ 修复：指定设备
             if flip_mask.any():
-                image_aug[flip_mask] = torch.flip(image_aug[flip_mask], dims=[2])
+                # ✅ 修复：使用循环避免高级索引的潜在问题
+                for idx in torch.where(flip_mask)[0]:
+                    image_aug[idx] = torch.flip(image_aug[idx], dims=[1])  # dims=[1] 对应 W 维度
             
             # 随机亮度调整 (范围: 0.8 - 1.2)
-            brightness_factor = torch.rand(batch_size, 1, 1, 1).cuda(self.gpu_id) * BRIGHTNESS_RANGE + BRIGHTNESS_MIN
+            brightness_factor = torch.rand(batch_size, 1, 1, 1, device=device) * BRIGHTNESS_RANGE + BRIGHTNESS_MIN
             image_aug = image_aug * brightness_factor
             image_aug = torch.clamp(image_aug, 0, 1)
             
-            # 随机灰度化 (20% 概率) - vectorized
-            gray_mask = torch.rand(batch_size) < 0.2
+            # 随机灰度化 (20% 概率)
+            gray_mask = torch.rand(batch_size, device=device) < 0.2  # ✅ 修复：指定设备
             if gray_mask.any():
-                # 转换为灰度图 (保持 3 通道) - vectorized computation
                 gray = (RGB_TO_GRAY_WEIGHTS[0] * image_aug[:, 0] + 
                         RGB_TO_GRAY_WEIGHTS[1] * image_aug[:, 1] + 
                         RGB_TO_GRAY_WEIGHTS[2] * image_aug[:, 2])
-                gray_3ch = gray.unsqueeze(1).repeat(1, 3, 1, 1)
-                image_aug[gray_mask] = gray_3ch[gray_mask]
+                gray_3ch = gray.unsqueeze(1). expand(-1, 3, -1, -1)  # ✅ 使用 expand 替代 repeat，更高效
+                # ✅ 修复：使用 where 替代高级索引
+                gray_mask_expanded = gray_mask.view(-1, 1, 1, 1). expand_as(image_aug)
+                image_aug = torch.where(gray_mask_expanded, gray_3ch, image_aug)
             
             # 3. 重新归一化
             image_aug = (image_aug - self.clip_mean) / self.clip_std
@@ -174,9 +174,8 @@ class MMLSurgAdaptTrainer():
     
     def train(self, input, target, criterion, epoch, epoch_i) -> torch.Tensor:
         image = input.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
         
-        # [新增] 检查是否需要生成增强数据用于一致性损失
-        # 三个条件：1. use_consistency 开启  2. 训练模式  3. criterion 有 cons_weight 且 > 0
         need_augmentation = (
             self.use_consistency and 
             self.model.training and 
@@ -184,36 +183,24 @@ class MMLSurgAdaptTrainer():
             criterion.cons_weight > 0
         )
         
-        # [修改] 智能判断：根据 Loss 的需求决定传什么
         if getattr(criterion, 'needs_features', False):
-            # --- 分支 A: 针对 BBAM (需要特征) ---
             with autocast():
-                # 使用 self.model_unwrap 统一处理 DDP 和 单卡情况
-                # 确保 input 类型正确
-                features = self.model_unwrap.image_encoder(image.type(self.model_unwrap.dtype))
-                
-                # 3. 归一化 (BBAM 必须步骤)
+                features = self.model_unwrap.image_encoder(image.type(self. model_unwrap.dtype))
                 features = torch.nn.functional.normalize(features, p=2, dim=-1)
-                
-            # 4. 计算 Loss (传入特征)
             loss, _ = criterion(features, target, epoch)
             
         else:
-            # --- 分支 B: 针对普通 Loss ---
             if need_augmentation:
-                # 生成增强图像
                 image_aug = self._apply_consistency_augmentation(image)
-                # 拼接原图和增强图：[2*B, C, H, W]
                 combined_image = torch.cat([image, image_aug], dim=0)
                 
                 with autocast():
-                    # 模型前向传播，得到 [2*B, num_classes] 的输出
                     output = self.model(combined_image).float()
                 
-                # 损失函数内部会自动检测 logits.shape[0] == 2 * batch_size 并计算一致性损失
-                loss, _ = criterion(output, target, epoch)
+                # ✅ 关键修复：获取实际的 batch_size 并传给 criterion
+                actual_batch_size = image.shape[0]  # 原始图像的 batch size
+                loss, _ = criterion(output, target, epoch, batch_size=actual_batch_size)
             else:
-                # 不需要增强，正常前向传播
                 with autocast():
                     output = self.model(image).float()
                 loss, _ = criterion(output, target, epoch)
