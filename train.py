@@ -19,7 +19,7 @@ from sklearn.metrics import f1_score, average_precision_score
 from datetime import timedelta
 # 项目内部模块导入
 import ivtmetrics
-import args
+from args import args
 from log import logger
 from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
