@@ -1495,7 +1495,7 @@ class SemanticAssociationModule(nn.Module):
 # ==============================================================================
 # 4. [最终模型] MMLSurgAdaptSCPNet
 # ==============================================================================
-class MMLSurgAdaptSCPNet(nn.Module):
+class MMLSurgAdaptSCPNetConsistency(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         # 1. 基础组件
@@ -1562,3 +1562,70 @@ class MMLSurgAdaptSCPNet(nn.Module):
         
         # 返回 logits 用于主 Loss，返回 A_star 用于正则化 Loss
         return logits, self.A_star
+    
+class MMLSurgAdaptSCPNet(nn.Module):
+    """
+    与 MMLSurgAdaptSCPNetConsistency 结构保持一致，但**不包含一致性增强**（BatchAugmentation）
+    并且 forward 只返回 logits（不会返回 A_star），因此上层训练时不会计算额外的 consistency loss。
+    """
+    def __init__(self, classnames, clip_model):
+        super().__init__()
+        # CLIP 组件
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+        # Prompt Learner (可学习 prompt)
+        self.prompt_learner = PromptLearner(classnames, clip_model)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+
+        # --- 使用 SCPNet 的 SPP + SAM（与 consistency 版本一致） ---
+        # Structured Prior Prompter（构建并缓存 A_star）
+        self.spp = StructuredPriorPrompter(classnames, clip_model)
+        # 缓存 A_star，但非一致性版本不会额外使用 augmentor 或返回 A_star
+        self.register_buffer("A_star", self.spp())
+
+        # 获取特征维度（兼容多种 clip_model）
+        try:
+            feat_dim = clip_model.text_projection.shape[1]
+        except Exception:
+            feat_dim = 1024
+
+        # Semantic Association Module (GCN)
+        self.sam = SemanticAssociationModule(feat_dim, feat_dim)
+
+        # 注意：**不**创建 BatchAugmentation 或一致性相关组件
+
+    def encode_image(self, image, visual_adapter_func=None):
+        """
+        与 consistency 版本保持一致的图像编码接口，便于复用上游代码。
+        """
+        if visual_adapter_func is not None:
+            image_features = self.image_encoder([image.type(self.dtype), visual_adapter_func])
+        else:
+            image_features = self.image_encoder(image.type(self.dtype))
+        return image_features
+
+    def forward(self, image, text_features=None):
+        """
+        返回 logits（用于主监督 loss）。
+        不返回 A_star，也不执行任何额外的一致性计算。
+        """
+        # 1) 图像编码
+        image_input = image
+        image_features = self.encode_image(image_input)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        # 2) 文本 prompt -> 编码 H0
+        child_prompts = self.prompt_learner()
+        Z = self.text_encoder(child_prompts, self.tokenized_prompts)
+
+        # 3) 使用 SAM（GCN）与预先计算好的 A_star 优化文本特征
+        text_features_refined = self.sam(Z, self.A_star)
+        text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
+
+        # 4) 计算 logits（保持与 consistency 版本相同的缩放）
+        logits = 10 * image_features @ text_features_refined.t()
+
+        return logits
