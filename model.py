@@ -1371,95 +1371,101 @@ class StructuredPriorPrompter(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         
-        # 从 cfg 读取参数
-        # 注意：不再使用 top_k，改用 sim_threshold
+        # 参数读取
         s_reweight = getattr(cfg, 'reweight_p', 0.2) 
-        t_smooth = getattr(cfg, 't_smooth', 0.07) # 温度系数
-        sim_threshold = getattr(cfg, 'sim_threshold', 0.05) # [新增] 相似度阈值过滤底噪
+        t_smooth = getattr(cfg, 't_smooth', 0.07) 
+        sim_threshold = getattr(cfg, 'sim_threshold', 0.05) 
         
         if hasattr(cfg, 'child_num') and cfg.child_num > 0: 
             classnames = classnames[0:cfg.child_num]
         self.n_cls = len(classnames)
         dtype = clip_model.dtype
         
-        # --- 1. 派生静态标签特征 z_i ---
+        # 1. 计算 CLIP 特征
         template = "a photo of a {}."
         classnames_proc = [name.replace("_", " ") for name in classnames]
         prompts = [template.format(name) for name in classnames_proc]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         
-        # 获取文本特征
         with torch.no_grad():
             z_static = clip_model.encode_text(tokenized_prompts).type(dtype)
-        
         z_static = F.normalize(z_static, p=2, dim=-1)
         
-        # --- 2. 计算原始相关性矩阵 A ---
-        # A: [110, 110]
-        A = torch.matmul(z_static, z_static.t())
+        # 原始相似度 A
+        A_raw = torch.matmul(z_static, z_static.t())
         
         # ======================================================================
-        # [修改逻辑 1] 应用结构化互斥掩码 (Structured Mask)
-        # 目标：Phase不可推导Phase，View不可推导View，但Phase可以推导Action
+        # 步骤 1: 必须先构建并应用互斥掩码 (Mask)
+        # 目的：在归一化之前，就把 Phase vs Phase 彻底杀死，防止它们干扰 row_max 计算
         # ======================================================================
         
-        # 定义互斥组的索引范围 (左闭右开)
-        # 0-7: Phase, 7-10: Safety, 10-110: Action (根据你的描述)
-        group_ranges = [
-            (0, 7),     # Phase
-            (7, 10),    # Safety View
-            (10, 110)   # Action Triplets
-        ]
+        structure_mask = torch.ones_like(A_raw, dtype=torch.bool)
         
-        # 初始化全 1 (True) 的掩码
-        structure_mask = torch.ones_like(A, dtype=torch.bool)
+        # 0-7: Phase, 7-10: View, 10-110: Action
         
-        # 将组内互斥区域设为 False (0)
-        for start, end in group_ranges:
-            structure_mask[start:end, start:end] = False
-            
-        # [重要] 恢复对角线为 True (自己必须和自己相关)
+        # Phase vs Phase -> 互斥 (设为0)
+        structure_mask[0:7, 0:7] = False
+        
+        # View vs View -> 互斥 (设为0)
+        structure_mask[7:10, 7:10] = False
+        
+        # 对角线暂时保留 (后面会单独处理 Self-loop)
         structure_mask.fill_diagonal_(True)
         
-        # 应用结构化掩码：直接把互斥区域的相似度清零
-        A_masked = A * structure_mask.float()
+        # 应用掩码：彻底清零互斥区
+        A_masked = A_raw * structure_mask.float()
         
         # ======================================================================
-        # [修改逻辑 2] 替代 Top-K，使用阈值过滤 (Thresholding)
+        # 步骤 2: 分块最大值归一化 (Block-wise Max Norm)
+        # 现在的输入已经是被 Mask 干净的 A_masked 了
         # ======================================================================
         
-        # 任何小于阈值的相关性视为噪声，置为 0
-        # 这样保留了大类间的强关联（如 Phase->Action），去除了弱关联
-        A_sparse = torch.where(A_masked > sim_threshold, A_masked, torch.zeros_like(A_masked))
+        A_norm = torch.zeros_like(A_masked)
+        ranges = [(0, 7), (7, 10), (10, 110)]
         
-        # --- 3. 归一化与自循环加权 A* ---
-        A_exp = torch.exp(A_sparse / t_smooth)
+        for src_start, src_end in ranges:          
+            for tgt_start, tgt_end in ranges:      
+                
+                # 提取子块
+                block = A_masked[src_start:src_end, tgt_start:tgt_end]
+                
+                # 特殊处理：如果是 Phase-Phase 这种已经被 Mask 成全 0 的块
+                # 直接跳过，保持 A_norm 里的 0
+                if block.sum() == 0:
+                    continue
+                
+                # 1. 阈值过滤
+                block_thresh = torch.where(block > sim_threshold, block, torch.zeros_like(block))
+                
+                # 2. 计算该块每行的最大值
+                block_max, _ = block_thresh.max(dim=1, keepdim=True)
+                
+                # 3. 归一化 (让该块最强关联变为 1.0)
+                block_norm = block_thresh / (block_max + 1e-12)
+                
+                # 4. 填回
+                A_norm[src_start:src_end, tgt_start:tgt_end] = block_norm
+
+        # ======================================================================
+        # 步骤 3: 调整对角线权重 (Self-loop)
+        # ======================================================================
         
-        # 再次确保被 mask 掉的地方是 0 (防止 exp(0)=1 产生影响)
-        mask_zeros = (A_sparse > 1e-6).float()
-        A_star_numerator = A_exp * mask_zeros
+        A_final = A_norm.to(A_raw.device)
+        dialog_indices = torch.eye(self.n_cls, dtype=torch.bool).to(A_raw.device)
         
-        # 行归一化 (Row Normalization)
-        A_star_denominator = A_star_numerator.sum(dim=1, keepdim=True)
-        A_star_normalized = A_star_numerator / (A_star_denominator + 1e-12)
+        # 先清空对角线 (因为之前 block norm 可能会把对角线也变成 1)
+        A_final[dialog_indices] = 0.0 
         
-        A_star = A_star_normalized.to(A.device)
+        # 缩放邻居权重
+        A_final = A_final * (1.0 - s_reweight) 
         
-        # --- 4. 调整自循环权重 (Self-loop Reweighting) ---
-        # 这一步是为了平衡自身特征和邻居特征的比例
-        dialog_indices = torch.eye(self.n_cls, dtype=torch.bool).to(A.device)
+        # 填回固定的自身权重
+        A_final[dialog_indices] = s_reweight
         
-        A_star[dialog_indices] = 0.0 # 先清空对角线
-        A_star = A_star * (1.0 - s_reweight) # 缩放邻居权重
-        A_star[dialog_indices] = s_reweight  # 填回自身权重
-        
-        # 注册为 buffer (不更新梯度)
-        self.register_buffer("A_star", A_star)
+        self.register_buffer("A_star", A_final)
 
     def forward(self):
         return self.A_star
-
-
 class SemanticAssociationModule(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -1617,15 +1623,33 @@ class MMLSurgAdaptSCPNet(nn.Module):
         image_features = self.encode_image(image_input)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        # 2) 文本 prompt -> 编码 H0
+        # 2) 文本 Prompt ... (保持不变)
         child_prompts = self.prompt_learner()
         Z = self.text_encoder(child_prompts, self.tokenized_prompts)
 
-        # 3) 使用 SAM（GCN）与预先计算好的 A_star 优化文本特征
-        text_features_refined = self.sam(Z, self.A_star)
+        # ======================================================================
+        # [防爆处理] GCN 专用归一化
+        # ======================================================================
+        # self.A_star 是我们要传给 Loss 的那个"数值大"的矩阵 (Max Norm)
+        # 但 GCN 不能吃这个，必须吃"行和为1"的矩阵 (Row-Sum Norm)
+        
+        # 计算行和
+        row_sum = self.A_star.sum(dim=1, keepdim=True)
+        # 临时归一化 (不会修改 self.A_star 本身)
+        A_gcn = self.A_star / (row_sum + 1e-12)
+        
+        # 3) 使用 SAM（GCN）
+        # [关键] 传 A_gcn 进去，保证数值稳定
+        text_features_refined = self.sam(Z, A_gcn) 
+        
         text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
 
-        # 4) 计算 logits（保持与 consistency 版本相同的缩放）
+        # 4) 计算 logits
         logits = 10 * image_features @ text_features_refined.t()
 
-        return logits
+        # [关键] 返回原始的 self.A_star 给 Loss 使用
+        # 这样 Soft Target 拿到的就是 0.8 这样的大数值，而不是被稀释后的 0.02
+        if isinstance(self, MMLSurgAdaptSCPNetConsistency):
+             return logits, self.A_star 
+        else:
+             return logits
