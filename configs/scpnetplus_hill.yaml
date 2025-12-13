@@ -1,0 +1,82 @@
+# ==============================================================================
+# Training Basics
+# ==============================================================================
+n_ctx: 4
+model: SCPNet_Plus                  # [关键修改] 指定使用集成创新点的新模型类
+model_name: scpnet                  # 内部标识，保持 scpnet 即可
+backbone : ViT-L/14                 # 建议使用 ViT 以支持 Patch 特征 (创新点 TGMI 需要)
+
+# 路径配置 (建议修改名字以区分新旧实验)
+checkpoint: cholec_vals/scpnet_plus_innovations
+log_file: scpnet_plus_innovations.txt
+dir : trial_scpnet_plus_innovations
+
+# 优化器参数
+batch_size: 16
+accumulation_steps: 2
+lr: 1e-5
+epochs: 15
+change_epoch: 1                     # Warmup epoch
+init_epochs : 5
+init_lr : 1e-5
+seed: 0
+
+# ==============================================================================
+# Loss Function Strategy (回归本源)
+# ==============================================================================
+loss : Hill                         # [关键] 保持 Hard Hill Loss (根据您的反馈，硬标签效果更好)
+                                    # 注：创新点 SGLC 会在 logits 层面进行软补偿，不需要 Loss 层面再软化
+
+# ==============================================================================
+# [Innovation 1] Structure-Aware Prior (GCN & SPP Advanced)
+# ==============================================================================
+gcn_layers: 3                       # GCN 层数
+reweight_p: 0.2                     # 自循环权重 (Self-loop weight)
+top_k: 30                           # [建议增大] 配合 Min-Max 归一化，Top-K 可以稍微大一点 (10 -> 30)
+sim_threshold: 0.15                 # [新增] 相似度阈值，过滤掉 CLIP 的底噪 (配合 SPP_Advanced)
+t_smooth: 0.07                      # 平滑温度 (保留参数以兼容旧代码读取)
+
+# ==============================================================================
+# [Innovation 2] Consistency Regularization (Dual-Stream)
+# ==============================================================================
+use_consistency: True               # [新增] 开启一致性增强训练
+w_cons: 1.0                         # [新增] 一致性损失的权重 (MSE Loss Weight)
+
+# 增强强度参数 (可微调)
+cons_flip_prob: 0.5
+cons_brightness_range: 0.4
+cons_brightness_min: 0.8
+cons_gray_prob: 0.2
+
+# ==============================================================================
+# Dataset & Labels
+# ==============================================================================
+num_classes: 110
+child_num: 110
+child_n_ctx: 4
+child_ctx_init: a photo
+#parent_n_ctx: 4
+#parent_ctx_init: a photo of a
+
+relation_file: cholec/word2vec_similarity_matrix.npy # (SCPNet_Plus 会优先用动态计算的 A_star，这个文件可能不再核心依赖)
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+label_file: label_jsons/data1.json
+
+val_sp : True
+val_methods : ['pp_map', 'pp_loss', 'sp_loss']
+perform_init : False
+init_train_file : triplet_train_labels.json
+init_val_file : triplet_val_labels.json
+ratio: 1
+image_size: 224
+use_lfile : False
+getitem : False
+partial: True
+
+# ==============================================================================
+# Testing
+# ==============================================================================
+ckpt: temp.ckpt
+test_dir: trial_test_scpnet_plus_innovations
+test_loss: Hill

@@ -89,6 +89,7 @@ class MMLSurgAdaptTrainer():
         elif model_name == 'CLIP-TextAttention-CoOp': self.model = CLIP_TextAttentionCoOp(classnames, clip_model)
         elif model_name == 'CLIP-CoOp-LoRA': self.model = CLIPCoOpLoRA(classnames, clip_model)
         elif model_name == 'SCPNet': self.model = MMLSurgAdaptSCPNet(classnames, clip_model)
+        elif model_name == 'SCPNet_Plus' : self.model = MMLSurgAdaptSCPNet(classnames, clip_model)
         else:
             raise NameError(f"Model '{model_name}' not recognized.")
 
