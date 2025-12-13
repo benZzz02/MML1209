@@ -6,7 +6,7 @@ model_name: scpnet
 batch_size: 16
 accumulation_steps: 2
 lr: 1e-5
-epochs: 15
+epochs: 10
 reweight_p: 0.2
 relation_file: cholec/word2vec_similarity_matrix.npy
 ratio: 1
