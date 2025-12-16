@@ -374,7 +374,22 @@ class SCPNetTrainer():
         elif model_name == 'CLIP-CoOp-LoRA': self.model = CLIPCoOpLoRA(classnames, clip_model)
         # [SCPNet]
         elif model_name == 'SCPNet': self.model = MMLSurgAdaptSCPNet(classnames, clip_model)
-        elif model_name == 'SCPNet_Plus': self.model = MMLSurgAdaptSCPNet_Plus(classnames, clip_model)
+        elif model_name == 'SCPNet_Plus': 
+            print("-" * 50)
+            print(f"[DEBUG CHECK] Reading Config:")
+            print(f" >> Alpha (SGLC): {getattr(cfg, 'sglc_alpha', 'Not Found')}")
+            print(f" >> Threshold (SPP): {getattr(cfg, 'sim_threshold', 'Not Found')}")
+            print(f" >> Top-K (SPP): {getattr(cfg, 'top_k', 'Not Found')}")
+            print("-" * 50)
+            # ==================================================
+
+            self.model = MMLSurgAdaptSCPNet_Plus(
+                classnames, 
+                clip_model,
+                alpha=getattr(cfg, 'sglc_alpha', 0.1),         
+                sim_threshold=getattr(cfg, 'sim_threshold', 0.25), 
+                top_k=getattr(cfg, 'top_k', 10)               
+            )
         else:
             raise NameError(f"Model '{model_name}' not recognized.")
 
