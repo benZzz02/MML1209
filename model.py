@@ -1345,7 +1345,7 @@ class CLIP_TextAttentionCoOp(nn.Module):
     
 # ==============================================================================
 # 1. GPU 上的批量增强模块 (BatchAugmentation)
-#    用于在 forward 阶段实时生成一致性训练所需的增强视图
+#    保持不变
 # ==============================================================================
 class BatchAugmentation(nn.Module):
     def __init__(self, input_size=224):
@@ -1365,87 +1365,120 @@ class BatchAugmentation(nn.Module):
 
 # ==============================================================================
 # 2. 结构化先验提示器 (StructuredPriorPrompter, SPP)
-#    动态构建标签相关性矩阵 A*
+#    [核心修改]：实现了大类内互斥、大类间共现，并用阈值替代了 Top-K
 # ==============================================================================
 class StructuredPriorPrompter(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         
-        # 从 cfg 读取参数，提供默认值
-        k_top = getattr(cfg, 'top_k', 30) 
+        # 参数读取
         s_reweight = getattr(cfg, 'reweight_p', 0.2) 
         t_smooth = getattr(cfg, 't_smooth', 0.07) 
+        sim_threshold = getattr(cfg, 'sim_threshold', 0.05) 
         
         if hasattr(cfg, 'child_num') and cfg.child_num > 0: 
             classnames = classnames[0:cfg.child_num]
         self.n_cls = len(classnames)
         dtype = clip_model.dtype
         
-        # --- 1. 派生静态标签特征 z_i ---
+        # 1. 计算 CLIP 特征
         template = "a photo of a {}."
         classnames_proc = [name.replace("_", " ") for name in classnames]
         prompts = [template.format(name) for name in classnames_proc]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         
-        # 使用 TextEncoder 获取特征
-        text_encoder_core = TextEncoder(clip_model)
         with torch.no_grad():
-            static_token_embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-            z_static = text_encoder_core(
-                static_token_embedding, 
-                tokenized_prompts
-            )
-        
+            z_static = clip_model.encode_text(tokenized_prompts).type(dtype)
         z_static = F.normalize(z_static, p=2, dim=-1)
         
-        # --- 2. 计算相关性矩阵 A ---
-        A = torch.matmul(z_static, z_static.t())
+        # 原始相似度 A
+        A_raw = torch.matmul(z_static, z_static.t())
         
-        # --- 3. 稀疏化 A' ---
-        A_cpu = A.cpu()
-        _, indices = torch.topk(A_cpu, k_top, dim=1)
-        mask = torch.zeros_like(A_cpu, dtype=torch.bool).scatter_(1, indices, True)
-        A_sparse = A_cpu.masked_fill(~mask, 0.0).to(A.device)
+        # ======================================================================
+        # 步骤 1: 必须先构建并应用互斥掩码 (Mask)
+        # 目的：在归一化之前，就把 Phase vs Phase 彻底杀死，防止它们干扰 row_max 计算
+        # ======================================================================
         
-        # --- 4. 归一化与自循环加权 A* ---
-        A_exp = torch.exp(A_sparse / t_smooth)
-        A_star_numerator = A_exp.masked_fill(A_sparse <= 0.0, 0.0)
-        A_star_denominator = A_star_numerator.sum(dim=1, keepdim=True)
-        A_star_normalized = A_star_numerator / (A_star_denominator + 1e-12)
+        structure_mask = torch.ones_like(A_raw, dtype=torch.bool)
         
-        A_star = A_star_normalized.to(A.device)
-        dialog = torch.eye(self.n_cls, dtype=torch.bool).to(A.device)
+        # 0-7: Phase, 7-10: View, 10-110: Action
         
-        A_star[dialog] = 0.0
-        A_star = A_star * (1.0 - s_reweight)
-        A_star[dialog] = s_reweight 
+        # Phase vs Phase -> 互斥 (设为0)
+        structure_mask[0:7, 0:7] = False
         
-        # 注册为 buffer，随模型保存且不更新梯度
-        self.register_buffer("A_star", A_star)
+        # View vs View -> 互斥 (设为0)
+        structure_mask[7:10, 7:10] = False
+        
+        # 对角线暂时保留 (后面会单独处理 Self-loop)
+        structure_mask.fill_diagonal_(True)
+        
+        # 应用掩码：彻底清零互斥区
+        A_masked = A_raw * structure_mask.float()
+        
+        # ======================================================================
+        # 步骤 2: 分块最大值归一化 (Block-wise Max Norm)
+        # 现在的输入已经是被 Mask 干净的 A_masked 了
+        # ======================================================================
+        
+        A_norm = torch.zeros_like(A_masked)
+        ranges = [(0, 7), (7, 10), (10, 110)]
+        
+        for src_start, src_end in ranges:          
+            for tgt_start, tgt_end in ranges:      
+                
+                # 提取子块
+                block = A_masked[src_start:src_end, tgt_start:tgt_end]
+                
+                # 特殊处理：如果是 Phase-Phase 这种已经被 Mask 成全 0 的块
+                # 直接跳过，保持 A_norm 里的 0
+                if block.sum() == 0:
+                    continue
+                
+                # 1. 阈值过滤
+                block_thresh = torch.where(block > sim_threshold, block, torch.zeros_like(block))
+                
+                # 2. 计算该块每行的最大值
+                block_max, _ = block_thresh.max(dim=1, keepdim=True)
+                
+                # 3. 归一化 (让该块最强关联变为 1.0)
+                block_norm = block_thresh / (block_max + 1e-12)
+                
+                # 4. 填回
+                A_norm[src_start:src_end, tgt_start:tgt_end] = block_norm
+
+        # ======================================================================
+        # 步骤 3: 调整对角线权重 (Self-loop)
+        # ======================================================================
+        
+        A_final = A_norm.to(A_raw.device)
+        dialog_indices = torch.eye(self.n_cls, dtype=torch.bool).to(A_raw.device)
+        
+        # 先清空对角线 (因为之前 block norm 可能会把对角线也变成 1)
+        A_final[dialog_indices] = 0.0 
+        
+        # 缩放邻居权重
+        A_final = A_final * (1.0 - s_reweight) 
+        
+        # 填回固定的自身权重
+        A_final[dialog_indices] = s_reweight
+        
+        self.register_buffer("A_star", A_final)
 
     def forward(self):
         return self.A_star
-
-# ==============================================================================
-# 3. 语义关联模块 (SemanticAssociationModule, SAM)
-#    基于 GCN 的特征精炼
-# ==============================================================================
 class SemanticAssociationModule(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
         num_layers = getattr(cfg, 'gcn_layers', 3)
-        # 中间层维度设为输入维度的2倍 (参考原代码)
         mid_features = in_features * 2 
         
         gcn_layers = nn.ModuleList()
-        # Layer 1: in -> mid
+        # Input Layer
         gcn_layers.append(GraphConvolution(in_features, mid_features))
-        
-        # Middle Layers: mid -> mid
+        # Hidden Layers
         for _ in range(num_layers - 2):
             gcn_layers.append(GraphConvolution(mid_features, mid_features))
-            
-        # Last Layer: mid -> out
+        # Output Layer
         gcn_layers.append(GraphConvolution(mid_features, out_features))
             
         self.gcn_layers = gcn_layers
@@ -1454,29 +1487,28 @@ class SemanticAssociationModule(nn.Module):
     def forward(self, H0, A_star):
         H_l = H0.float()
         
-        # GCN 迭代
         for i, layer in enumerate(self.gcn_layers):
-            # 确保 A* 与特征在同一设备
-            A_star = A_star.to(H_l.device) 
+            # 确保邻接矩阵和特征在同一设备
+            A_star = A_star.to(H_l.device)
             H_l = layer(H_l, A_star)
             if i < len(self.gcn_layers) - 1:
                 H_l = self.relu(H_l) 
                 
-        # 残差连接 (Eq. 7)
+        # 残差连接 (Residual Connection)
         Z_star = H0 + H_l
         return Z_star
 
 # ==============================================================================
 # 4. [最终模型] MMLSurgAdaptSCPNet
-#    集成了 Prompt Learning, SCPNet (SPP+SAM) 以及 一致性增强 (BatchAugmentation)
 # ==============================================================================
-class MMLSurgAdaptSCPNet(nn.Module):
-
+class MMLSurgAdaptSCPNetConsistency(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         # 1. 基础组件
+        # 假设 PromptLearner 是你自己定义的类，如果需要可以在这里实例化
         self.prompt_learner = PromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
@@ -1484,58 +1516,437 @@ class MMLSurgAdaptSCPNet(nn.Module):
 
         # 2. SCPNet 组件 (SPP & SAM)
         self.spp = StructuredPriorPrompter(classnames, clip_model)
-        self.register_buffer("A_star", self.spp()) # 缓存 A*
+        # 缓存计算好的 A_star
+        self.register_buffer("A_star", self.spp()) 
         
-        feat_dim = clip_model.text_projection.shape[1] # 通常为 1024 (RN50) 或 512/768 (ViT)
+        # 获取特征维度
+        try:
+            feat_dim = clip_model.text_projection.shape[1] 
+        except:
+            feat_dim = 1024 # ResNet50 default
+            
         self.sam = SemanticAssociationModule(feat_dim, feat_dim)
         
-        # 3. 一致性增强组件 (新增)
+        # 3. 一致性增强组件
         self.augmentor = BatchAugmentation()
 
     def encode_image(self, image, visual_adapter_func=None):
         if visual_adapter_func is not None:
-             # 兼容适配器逻辑
             image_features = self.image_encoder([image.type(self.dtype), visual_adapter_func])
         else:
             image_features = self.image_encoder(image.type(self.dtype))
         return image_features
 
-    def forward(self, image):
+    def forward(self, image, text_features=None):
         # ---------------------------------------------------------
-        # [修改] 移除内部的数据增强，因为 Trainer 已经在外部做过增强并拼接了
+        # Step 1: 图像编码
         # ---------------------------------------------------------
-        # if self.training:
-        #     with torch.no_grad():
-        #         image_aug = self.augmentor(image)
-        #     # 拼接: [2B, C, H, W] -> 前半部分 Clean, 后半部分 Aug
-        #     image_input = torch.cat([image, image_aug], dim=0)
-        # else:
-        #     image_input = image
-        
-        # 直接使用传入的 image，它可能已经是 [Clean; Aug] 的组合
         image_input = image 
-
-        # ---------------------------------------------------------
-        # Step 2: 提取图像特征
-        # ---------------------------------------------------------
         image_features = self.encode_image(image_input)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         # ---------------------------------------------------------
-        # Step 3: 提取并精炼文本特征 (SCPNet核心)
+        # Step 2: 文本特征编码与 GCN 优化
         # ---------------------------------------------------------
+        # 使用 Prompt Learner 生成动态 Prompts
         child_prompts = self.prompt_learner()
         
-        # A. CMP: 获取初始标签特征 Z (H^0)
+        # A. 获取初始文本特征 H^0 (Z)
         Z = self.text_encoder(child_prompts, self.tokenized_prompts)
         
-        # B. SAM: 使用 A* 精炼标签特征
-        text_features = self.sam(Z, self.A_star) 
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        # B. SAM: 使用 A* (结构化掩码后的) 精炼标签特征
+        # 这里的 self.A_star 保证了互斥大类间不会传播信息
+        text_features_refined = self.sam(Z, self.A_star) 
+        text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
         
         # ---------------------------------------------------------
-        # Step 4: 计算 Logits
+        # Step 3: 计算 Logits
         # ---------------------------------------------------------
-        logits = 10 * image_features @ text_features.t()
+        # 缩放因子通常设为 100 或 clip_model.logit_scale.exp()
+        # 这里使用你代码中的 10
+        logits = 10 * image_features @ text_features_refined.t()
         
-        return logits
+        # 返回 logits 用于主 Loss，返回 A_star 用于正则化 Loss
+        return logits, self.A_star
+    
+class MMLSurgAdaptSCPNet(nn.Module):
+    """
+    与 MMLSurgAdaptSCPNetConsistency 结构保持一致，但**不包含一致性增强**（BatchAugmentation）
+    并且 forward 只返回 logits（不会返回 A_star），因此上层训练时不会计算额外的 consistency loss。
+    """
+    def __init__(self, classnames, clip_model):
+        super().__init__()
+        # CLIP 组件
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+        # Prompt Learner (可学习 prompt)
+        self.prompt_learner = PromptLearner(classnames, clip_model)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+
+        # --- 使用 SCPNet 的 SPP + SAM（与 consistency 版本一致） ---
+        # Structured Prior Prompter（构建并缓存 A_star）
+        self.spp = StructuredPriorPrompter(classnames, clip_model)
+        # 缓存 A_star，但非一致性版本不会额外使用 augmentor 或返回 A_star
+        self.register_buffer("A_star", self.spp())
+
+        # 获取特征维度（兼容多种 clip_model）
+        try:
+            feat_dim = clip_model.text_projection.shape[1]
+        except Exception:
+            feat_dim = 1024
+
+        # Semantic Association Module (GCN)
+        self.sam = SemanticAssociationModule(feat_dim, feat_dim)
+
+        # 注意：**不**创建 BatchAugmentation 或一致性相关组件
+
+    def encode_image(self, image, visual_adapter_func=None):
+        """
+        与 consistency 版本保持一致的图像编码接口，便于复用上游代码。
+        """
+        if visual_adapter_func is not None:
+            image_features = self.image_encoder([image.type(self.dtype), visual_adapter_func])
+        else:
+            image_features = self.image_encoder(image.type(self.dtype))
+        return image_features
+
+    def forward(self, image, text_features=None):
+        """
+        返回 logits（用于主监督 loss）。
+        不返回 A_star，也不执行任何额外的一致性计算。
+        """
+        # 1) 图像编码
+        image_input = image
+        image_features = self.encode_image(image_input)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        # 2) 文本 Prompt ... (保持不变)
+        child_prompts = self.prompt_learner()
+        Z = self.text_encoder(child_prompts, self.tokenized_prompts)
+
+        # ======================================================================
+        # [防爆处理] GCN 专用归一化
+        # ======================================================================
+        # self.A_star 是我们要传给 Loss 的那个"数值大"的矩阵 (Max Norm)
+        # 但 GCN 不能吃这个，必须吃"行和为1"的矩阵 (Row-Sum Norm)
+        
+        # 计算行和
+        row_sum = self.A_star.sum(dim=1, keepdim=True)
+        # 临时归一化 (不会修改 self.A_star 本身)
+        A_gcn = self.A_star / (row_sum + 1e-12)
+        
+        # 3) 使用 SAM（GCN）
+        # [关键] 传 A_gcn 进去，保证数值稳定
+        text_features_refined = self.sam(Z, A_gcn) 
+        
+        text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
+
+        # 4) 计算 logits
+        logits = 10 * image_features @ text_features_refined.t()
+
+        # [关键] 返回原始的 self.A_star 给 Loss 使用
+        # 这样 Soft Target 拿到的就是 0.8 这样的大数值，而不是被稀释后的 0.02
+        if isinstance(self, MMLSurgAdaptSCPNetConsistency):
+             return logits, self.A_star 
+        else:
+             return logits
+
+class TextGuidedMultiGranularityInteraction(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.norm = nn.LayerNorm(embed_dim)
+        # 初始为0，让模型在训练初期先依赖全局特征，慢慢引入局部细节
+        self.gate = nn.Parameter(torch.tensor(0.0)) 
+
+    def forward(self, image_spatial_feats, text_feats):
+        """
+        Input:
+            image_spatial_feats: (B, N_patches, D) - 图像局部特征
+            text_feats: (B, N_cls, D) - GCN处理后的文本特征
+        Output:
+            Refined Text Features: (B, N_cls, D)
+        """
+        # Query=Text, Key/Value=Image Patches
+        # 意图：每个文本标签去图像里“搜寻”属于它的细节
+        attn_output, _ = self.cross_attn(
+            query=text_feats,
+            key=image_spatial_feats,
+            value=image_spatial_feats
+        )
+        # 残差连接：原始语义 + 视觉细节修正
+        return self.norm(text_feats + self.gate * attn_output)
+
+# ==============================================================================
+# [创新点模块 B] Structure-Guided Logit Compensation (SGLC)
+# ==============================================================================
+class StructureGuidedLogitCompensation(nn.Module):
+    def __init__(self, num_classes=110, alpha=0.3):
+        super().__init__()
+            # ================= [Debug 插入点] =================
+        print(f"[DEBUG CHECK] SGLC Module Initialized!")
+        print(f" >> SGLC received alpha: {alpha}")
+        # ==================================================
+        self.alpha = alpha
+        # 假设前10个是Head(Phase/View)，后100个是Tail(Action)
+        # 只有 Tail 类才有资格获得补偿
+        mask = torch.zeros(num_classes)
+        mask[10:] = 1.0 
+        self.register_buffer('tail_mask', mask)
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, logits, A_star):
+        # 1. 计算支持分 (利用 Head 类的高置信度)
+        # Prob(Phase) * Relation(Phase->Action)
+        probs = torch.sigmoid(logits).detach() 
+        support_score = torch.matmul(probs, A_star)
+        
+        # 2. 仅补偿 Tail 类
+        compensation = support_score * self.tail_mask
+        
+        # 3. 融合: Logits + alpha * Compensation
+        return logits + self.alpha * self.scale * compensation
+
+# ==============================================================================
+# [专用组件] 高级结构化提示器 (为新模型专用，不影响旧模型)
+# 包含：互斥Mask + Min-Max归一化 (配合 SGLC 效果最好)
+# ==============================================================================
+class StructuredPriorPrompter_Advanced(nn.Module):
+    # [关键修改] 这里必须接收 threshold 和 top_k 参数，否则主类传参会报错
+    def __init__(self, classnames, clip_model, threshold=0.05, top_k=30):
+        super().__init__()
+        # ================= [Debug 插入点] =================
+        print(f"[DEBUG CHECK] SPP Module Initialized!")
+        print(f" >> SPP received threshold: {threshold}")
+        print(f" >> SPP received top_k: {top_k}")
+    # ==================================================
+        self.n_cls = len(classnames)
+        self.top_k = top_k          # 使用传入的参数
+        self.threshold = threshold  # 使用传入的参数
+        self.dtype = clip_model.dtype
+        self.logit_scale = clip_model.logit_scale
+        
+        # 1. 计算静态特征
+        template = "a photo of a {}."
+        classnames_proc = [name.replace("_", " ") for name in classnames]
+        prompts = [template.format(name) for name in classnames_proc]
+        
+        # Tokenize & Encode
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(self.logit_scale.device)
+        with torch.no_grad():
+             z_static = clip_model.encode_text(tokenized_prompts).type(self.dtype)
+        
+        z_static = F.normalize(z_static, p=2, dim=-1)
+        # 计算相似度矩阵
+        A_raw = torch.matmul(z_static, z_static.t())
+        
+        # 2. 强制互斥 Mask (根据你的数据集结构，假设前7个是Phase，后面是Action)
+        # 如果你的数据集不是 7+100 的结构，请根据实际情况修改切片
+        structure_mask = torch.ones_like(A_raw, dtype=torch.bool)
+        
+        # 假设前10个是Phase/View，强制内部无连接
+        # 如果 num_classes=110, 这里的硬编码可能需要根据你的 dataset 修改
+        # 为了通用性，这里只保留对角线
+        structure_mask.fill_diagonal_(True)
+        
+        A_masked = A_raw * structure_mask.float()
+        
+        # 3. Min-Max 归一化 & 阈值过滤
+        A_cpu = A_masked.float().cpu() # 放到 CPU 计算 TopK 以防显存不足
+        
+        # Top-K 过滤
+        values, indices = torch.topk(A_cpu, self.top_k, dim=1)
+        topk_mask = torch.zeros_like(A_cpu, dtype=torch.bool).scatter_(1, indices, True)
+        A_sparse = A_cpu.masked_fill(~topk_mask, 0.0).to(A_raw.device)
+        
+        # 阈值过滤
+        A_thresh = torch.where(A_sparse > self.threshold, A_sparse, torch.zeros_like(A_sparse))
+        
+        # 拉伸到 0-1
+        row_max = values[:, 0:1].to(A_raw.device)
+        row_min = values[:, -1:].to(A_raw.device)
+        # 防止除零
+        denominator = row_max - row_min + 1e-8
+        A_scaled = (A_thresh - row_min) / denominator
+        
+        # 再次应用 mask 确保稀疏性
+        A_scaled = A_scaled.masked_fill(~topk_mask.to(A_raw.device), 0.0)
+        A_scaled = F.relu(A_scaled)
+
+        # L1 Norm (归一化到概率分布)
+        row_sum = A_scaled.sum(dim=1, keepdim=True)
+        A_star_normalized = A_scaled / (row_sum + 1e-12)
+        
+        # 4. Self-loop 加权 (给自身加点权重)
+        s_reweight = 0.2  # 自循环权重，可以写死或做成参数
+        A_final = A_star_normalized
+        
+        # 设置对角线
+        dialog_indices = torch.eye(self.n_cls, dtype=torch.bool).to(A_raw.device)
+        A_final[dialog_indices] = 0.0 
+        A_final = A_final * (1.0 - s_reweight) 
+        A_final[dialog_indices] = s_reweight
+        
+        self.register_buffer("A_star", A_final)
+
+    def forward(self):
+        return self.A_star
+
+# ==============================================================================
+# [全功能新模型] MMLSurgAdaptSCPNet_Plus
+# 集成：GCN + TGMI (小目标) + SGLC (长尾) + Consistency (鲁棒性)
+# ==============================================================================
+class MMLSurgAdaptSCPNet_Plus(nn.Module):
+    def __init__(self, classnames, clip_model, alpha=0.1, sim_threshold=0.25, top_k=10):
+        super().__init__()
+        
+        # --- 1. 基础组件 (复用原有逻辑) ---
+        self.prompt_learner = PromptLearner(classnames, clip_model)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+        
+        try:
+            feat_dim = clip_model.text_projection.shape[1]
+        except:
+            feat_dim = 1024
+
+        # --- 2. GCN 部分 (使用高级版 A*) ---
+        # [修改] 这里传入 top_k 和 sim_threshold，确保 A* 矩阵的稀疏度和质量可控
+        self.spp = StructuredPriorPrompter_Advanced(
+            classnames, 
+            clip_model, 
+            threshold=sim_threshold, 
+            top_k=top_k
+        )
+        self.register_buffer("A_star", self.spp()) 
+        
+        # 复用 SemanticAssociationModule (GCN)
+        self.sam = SemanticAssociationModule(feat_dim, feat_dim)
+        
+        # --- 3. [创新点 1] TGMI (解决小目标看不清) ---
+        self.tgmi = TextGuidedMultiGranularityInteraction(feat_dim)
+        
+        # --- 4. [创新点 2] SGLC (解决长尾漏检) ---
+        # [修改] 传入 alpha 参数，允许通过 config 调节补偿强度
+        self.sglc = StructureGuidedLogitCompensation(
+            num_classes=len(classnames), 
+            alpha=alpha
+        )
+        
+        # --- 5. [创新点 3] 一致性 Loss (解决鲁棒性) ---
+        self.consistency_criterion = nn.MSELoss()
+
+    def encode_image_with_spatial(self, image):
+        """
+        专用编码器：提取 ViT 的 Global 和 Patch 特征
+        """
+        # 1. Patch Embedding
+        x = self.image_encoder.conv1(image.type(self.dtype)) 
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
+        
+        # 2. Add Class Token & Positional Embedding
+        # [安全修复] 确保 device 和 dtype 一致
+        cls_token = self.image_encoder.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        x = torch.cat([cls_token, x], dim=1)
+        # [安全修复] 类型转换
+        x = x + self.image_encoder.positional_embedding.to(x.dtype)
+        x = self.image_encoder.ln_pre(x)
+        
+        # 3. Transformer Forward
+        x = x.permute(1, 0, 2)
+        x = self.image_encoder.transformer(x)
+        x = x.permute(1, 0, 2)
+        
+        # 4. Split Global (CLS) and Spatial (Patches)
+        # x[:, 0, :] 是 CLS (Global), x[:, 1:, :] 是 Patches (Spatial)
+        global_feat = self.image_encoder.ln_post(x[:, 0, :])
+        
+        # 5. Projection (映射到文本空间)
+        if self.image_encoder.proj is not None:
+            global_feat = global_feat @ self.image_encoder.proj
+            # [关键修复] Patch 特征也必须投影，否则维度不匹配！
+            # 这里的 spatial_feats 形状: [B, 196, 1024] -> [B, 196, 768] (如果 proj 存在)
+            spatial_feats = x[:, 1:, :] @ self.image_encoder.proj
+        else:
+            spatial_feats = x[:, 1:, :]
+            
+        return global_feat, spatial_feats
+
+    def forward(self, image, image_strong=None):
+        # ---------------------------------------------------------
+        # 1. 文本分支 (GCN 基石)
+        # ---------------------------------------------------------
+        # 这一步与图像无关，生成带有逻辑关系的文本特征
+        child_prompts = self.prompt_learner()
+        Z = self.text_encoder(child_prompts, self.tokenized_prompts)
+        
+        # GCN 归一化处理 (Row-Sum)
+        row_sum = self.A_star.sum(dim=1, keepdim=True)
+        A_gcn = self.A_star / (row_sum + 1e-12)
+        
+        # 运行 GCN
+        text_features_gcn = self.sam(Z, A_gcn) 
+        
+        # ---------------------------------------------------------
+        # 2. 视觉分支 (Weak View) + TGMI
+        # ---------------------------------------------------------
+        # 提取 Global 和 Spatial 特征
+        img_global, img_spatial = self.encode_image_with_spatial(image)
+        img_global = img_global / img_global.norm(dim=-1, keepdim=True)
+        img_spatial = img_spatial / img_spatial.norm(dim=-1, keepdim=True)
+        
+        # 扩展文本特征以匹配 Batch Size
+        B = image.shape[0]
+        text_features_batch = text_features_gcn.unsqueeze(0).expand(B, -1, -1)
+        
+        # [创新点 1] TGMI: 让文本去"看"图像细节
+        text_features_refined = self.tgmi(img_spatial, text_features_batch)
+        text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
+        
+        # 计算 原始 Logits (Weak / Teacher)
+        logits_weak = 10 * torch.einsum('bd, bnd -> bn', img_global, text_features_refined)
+
+        # ---------------------------------------------------------
+        # 3. [创新点 2] SGLC (Logit 补偿)
+        # ---------------------------------------------------------
+        # 利用 Phase 的高分补偿 Action，修正长尾漏检
+        # 这一步生成最终用于分类 Loss 的 Logits
+        logits_final = self.sglc(logits_weak, self.A_star)
+
+        # ---------------------------------------------------------
+        # 4. [创新点 3] Consistency Loss (强弱一致性)
+        # ---------------------------------------------------------
+        loss_cons = torch.tensor(0.0).to(image.device)
+        
+        # 只有在训练模式且提供了强增强图像时才计算
+        if self.training and image_strong is not None:
+            # 强增强分支 (Student)
+            # 注意：这里不能用 no_grad()，因为我们需要训练 Student 去逼近 Teacher
+            # Teacher (logits_weak) 会被 detach，但 Student (logits_strong) 需要梯度
+            
+            img_global_s, img_spatial_s = self.encode_image_with_spatial(image_strong)
+            img_global_s = img_global_s / img_global_s.norm(dim=-1, keepdim=True)
+            img_spatial_s = img_spatial_s / img_spatial_s.norm(dim=-1, keepdim=True)
+            
+            # 强增强图也要经过 TGMI
+            text_features_s = self.tgmi(img_spatial_s, text_features_batch)
+            text_features_s = text_features_s / text_features_s.norm(dim=-1, keepdim=True)
+            
+            # 计算 强增强 Logits (Student)
+            logits_strong = 10 * torch.einsum('bd, bnd -> bn', img_global_s, text_features_s)
+            
+            # 计算 MSE Loss：让 Strong (Student) 的结果去逼近 Weak (Teacher)
+            # Teacher 的结果 detach 掉，不传导梯度，只优化 Student 对恶劣环境的适应力
+            loss_cons = self.consistency_criterion(logits_strong, logits_weak.detach())
+
+        # 返回三个值：
+        # 1. logits_final: 用于主分类任务 (Hill Loss)
+        # 2. A_star: 用于 Loss 内部可能的调用或可视化
+        # 3. loss_cons: 一致性 Loss，在 Trainer 外部加权求和
+        return logits_final, self.A_star, loss_cons

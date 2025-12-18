@@ -1409,3 +1409,70 @@ class SPLC_Consistency(nn.Module):
         """ 验证阶段逻辑 """
         loss_splc, targets_new = self.loss_sup(logits, targets, epoch)
         return loss_splc, targets_new
+    
+class SoftTargetHill(nn.Module):
+    r""" 
+    Soft Target Hill Loss (兼容版)
+    """
+
+    def __init__(self, lamb: float = 1.5, margin: float = 1.0, gamma: float = 2.0, 
+                 soft_beta: float = 0.4, reduction: str = 'sum') -> None:
+        super(SoftTargetHill, self).__init__()
+        self.lamb = lamb
+        self.margin = margin
+        self.gamma = gamma
+        self.soft_beta = soft_beta
+        self.reduction = reduction
+
+    # [修改点 1] 增加了 epoch 参数以兼容通用 Trainer 接口
+    def forward(self, logits, targets, epoch=None, A_star=None):
+        """
+        Args:
+            logits : 模型预测输出 (Before Sigmoid), Shape: (N, C)
+            targets : 真实标签 GT (0 or 1), Shape: (N, C)
+            epoch : (Optional) 训练轮数，为了接口兼容保留
+            A_star : 结构化相关性矩阵, Shape: (C, C). 
+        """
+        
+        # ======================================================================
+        # 1. 生成 Soft Targets
+        # ======================================================================
+        if A_star is not None and self.soft_beta > 0:
+            if A_star.device != targets.device:
+                A_star = A_star.to(targets.device)
+            
+            neighbor_signal = torch.matmul(targets.float(), A_star)
+            soft_targets = targets + self.soft_beta * neighbor_signal
+            final_targets = torch.clamp(soft_targets, 0.0, 1.0)
+        else:
+            final_targets = targets
+
+        # ======================================================================
+        # 2. 计算 Hill Loss
+        # ======================================================================
+        
+        logits_margin = logits - self.margin
+        pred_pos = torch.sigmoid(logits_margin) 
+        pred_neg = torch.sigmoid(logits)       
+
+        # A. Focal Weight
+        pt = (1 - pred_pos) * final_targets + (1 - final_targets)
+        focal_weight = pt ** self.gamma
+
+        # B. Loss Calculation
+        los_pos = final_targets * torch.log(pred_pos + 1e-8)
+        los_neg = (1 - final_targets) * -(self.lamb - pred_neg) * (pred_neg ** 2)
+
+        loss = -(los_pos + los_neg)
+        loss *= focal_weight
+
+        # [修改点 2] 根据 reduction 处理并返回 tuple (loss, targets)
+        if self.reduction == 'sum':
+            loss_val = loss.sum()
+        elif self.reduction == 'mean':
+            loss_val = loss.mean()
+        else:
+            loss_val = loss
+
+        # 返回两个值，与你文件中其他 Loss 保持一致
+        return loss_val, targets

@@ -1,12 +1,12 @@
 # Training
 n_ctx: 4
-checkpoint: cholec_vals/scpnet_hill    # For saving checkpoints
-log_file: scpnet_hill.txt
+checkpoint: cholec_vals/scpnet_hill_softtarget    # For saving checkpoints
+log_file: scpnet_hill_softtarget.txt
 model_name: scpnet
 batch_size: 16
 accumulation_steps: 2
 lr: 1e-5
-epochs: 15
+epochs: 10
 reweight_p: 0.2
 relation_file: cholec/word2vec_similarity_matrix.npy
 ratio: 1
@@ -29,8 +29,8 @@ init_train_file : triplet_train_labels.json # Init labels
 init_val_file : triplet_val_labels.json # Init labels
 init_epochs : 5
 init_lr : 1e-5
-dir : trial_scpnet_hill  # Directory to save results
-loss : Hill  # Loss function
+dir : trial_scpnet_hill_softtarget  # Directory to save results
+loss : SoftTargetHill  # Loss function
 use_lfile : False  # If use label file
 getitem : False # If call random in getitem
 # Random in init if both false
@@ -44,9 +44,10 @@ model: SCPNet
 
 # Testing
 ckpt: temp.ckpt  # Ckpt path for inference
-test_dir: trial_test_scpnet_hill # Directory to save results
-test_loss: Hill  # Loss function
+test_dir: trial_test_scpnet_hill_softtarget # Directory to save results
+test_loss: SoftTargetHill  # Loss function
 
 gcn_layers: 3 # [SCPNet SAM] GCN 堆叠层数
-top_k: 10 # [SCPNet SPP] 用于生成稀疏关系矩阵的 Top-K 值
+sim_threshold: 0.05
 t_smooth: 0.07 # [SCPNet SPP] 用于关系矩阵归一化的平滑温度（论文 Eq. 4 中的 t）
+soft_beta: 0.2
