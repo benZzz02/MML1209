@@ -13,7 +13,8 @@ from typing import Optional, List, Tuple, Dict
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+# [修改 1] 彻底停用混合精度，不再需要 GradScaler 和 autocast
+# from torch.cuda.amp import GradScaler, autocast
 from torch.optim import lr_scheduler
 from sklearn.metrics import f1_score, average_precision_score
 from datetime import timedelta
@@ -42,6 +43,11 @@ from model import (
 )
 from surgvlp import SurgAVLP, CBertViT
 
+# =============================================================================
+# [修改 2] 强制开启 TF32 模式 (3090 手动开启后精度对齐 A100)
+# =============================================================================
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # =============================================================================
 # DDP 辅助函数
@@ -395,11 +401,13 @@ class SCPNetTrainer():
 
         logger.info(f"Successfully initialized model: {model_name}")
         self.classnames = classnames
+        # [修正] 初始化顺序：在 self.model 赋值后，封装 DDP 前执行转换
         if self.distributed:
             # 将模型中所有的 nn.BatchNorm 转换为 nn.SyncBatchNorm
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-            logger.info("已开启同步 BatchNorm (SyncBatchNorm)")
-# ----------------------------
+            if is_main_process():
+                logger.info("已开启同步 BatchNorm (SyncBatchNorm)")
+
         self.model.cuda(self.gpu_id)
         if self.distributed:
             self.model = DDP(self.model, device_ids=[self.gpu_id], output_device=self.gpu_id, find_unused_parameters=True)
@@ -423,7 +431,7 @@ class SCPNetTrainer():
             self.augmentor = None
             logger.info("Consistency regularization is DISABLED")
     
-    # [核心修复] train 函数中的 Loss 调用逻辑
+    # [修改 3] train 函数移除 autocast()，强制回归全精度 FP32
     def train(self, input, target, criterion, epoch, epoch_i) -> torch.Tensor:
         image = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
@@ -438,59 +446,56 @@ class SCPNetTrainer():
         if need_consistency:
             image_strong = self.augmentor.augment_batch(image.cpu()).cuda(non_blocking=True)
 
+        # 移除 with autocast(): 直接全精度计算
         if getattr(criterion, 'needs_features', False):
             # BBAM etc
-            with autocast():
-                features = self.model_unwrap.image_encoder(image.type(self.model_unwrap.dtype))
-                features = torch.nn.functional.normalize(features, p=2, dim=-1)
+            features = self.model_unwrap.image_encoder(image.type(self.model_unwrap.dtype))
+            features = torch.nn.functional.normalize(features, p=2, dim=-1)
             loss, _ = criterion(features, target, epoch)
             
         else:
-            with autocast():
-                # [适配] SCPNet 系列：支持 (image, strong) 输入和多返回值
-                if cfg.model in ['SCPNet', 'SCPNet_Plus', 'MMLSurgAdaptSCPNet_Plus']:
-                    output_tuple = self.model(image, image_strong)
-                    
-                    if isinstance(output_tuple, tuple):
-                        logits, A_star, loss_cons_internal = output_tuple
-                    else:
-                        logits, A_star, loss_cons_internal = output_tuple, None, 0.0
-                    
-                    # [修复 TypeError] 
-                    # 尝试传递 A_star，如果 Loss 不支持（如标准 Hill），则回退到普通调用
-                    try:
-                        loss_main, _ = criterion(logits, target, epoch, A_star=A_star)
-                    except TypeError:
-                        loss_main, _ = criterion(logits, target, epoch)
-                    
-                    w_cons = getattr(cfg, 'w_cons', 1.0)
-                    loss = loss_main + w_cons * loss_cons_internal
-
-                # [适配] 旧模型逻辑
+            # [适配] SCPNet 系列：支持 (image, strong) 输入和多返回值
+            if cfg.model in ['SCPNet', 'SCPNet_Plus', 'MMLSurgAdaptSCPNet_Plus']:
+                output_tuple = self.model(image, image_strong)
+                
+                if isinstance(output_tuple, tuple):
+                    logits, A_star, loss_cons_internal = output_tuple
                 else:
-                    if need_consistency:
-                        combined = torch.cat([image, image_strong], dim=0)
-                        combined_output = self.model(combined).float()
-                        
-                        batch_size = image.shape[0]
-                        output_clean = combined_output[:batch_size]
-                        output_aug = combined_output[batch_size:]
-                        
-                        if hasattr(criterion, 'cons_weight'):
-                            loss, _ = criterion(output_clean, output_aug, target, epoch)
-                        else:
-                            loss, _ = criterion(output_clean, target, epoch)
+                    logits, A_star, loss_cons_internal = output_tuple, None, 0.0
+                
+                try:
+                    loss_main, _ = criterion(logits, target, epoch, A_star=A_star)
+                except TypeError:
+                    loss_main, _ = criterion(logits, target, epoch)
+                
+                w_cons = getattr(cfg, 'w_cons', 1.0)
+                loss = loss_main + w_cons * loss_cons_internal
+
+            # [适配] 旧模型逻辑
+            else:
+                if need_consistency:
+                    combined = torch.cat([image, image_strong], dim=0)
+                    combined_output = self.model(combined).float()
+                    
+                    batch_size = image.shape[0]
+                    output_clean = combined_output[:batch_size]
+                    output_aug = combined_output[batch_size:]
+                    
+                    if hasattr(criterion, 'cons_weight'):
+                        loss, _ = criterion(output_clean, output_aug, target, epoch)
                     else:
-                        output = self.model(image).float()
-                        if hasattr(criterion, 'cons_weight'):
-                            loss, _ = criterion(output, None, target, epoch)
-                        else:
-                            loss, _ = criterion(output, target, epoch)
+                        loss, _ = criterion(output_clean, target, epoch)
+                else:
+                    output = self.model(image).float()
+                    if hasattr(criterion, 'cons_weight'):
+                        loss, _ = criterion(output, None, target, epoch)
+                    else:
+                        loss, _ = criterion(output, target, epoch)
             
         return loss
 
 # =============================================================================
-# 验证、初始化验证、保存函数
+# 验证、初始化验证、保存函数 (同样移除 autocast)
 # =============================================================================
 def validate(trainer, epoch: int, dir, criterion=None) -> dict:
     if not is_main_process():
@@ -532,18 +537,17 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
         target = target.cuda(non_blocking=True)
         input = input.cuda(non_blocking=True)
         with torch.no_grad():
-            with autocast():
-                # [适配] 取第一个返回值作为 Logits
-                out = model_to_run(input)
-                if isinstance(out, tuple): output_logits = out[0]
-                else: output_logits = out
-                
-                out_ema = ema_to_run(input)
-                if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
-                else: output_ema_logits = out_ema
+            # 移除 autocast()
+            out = model_to_run(input)
+            if isinstance(out, tuple): output_logits = out[0]
+            else: output_logits = out
+            
+            out_ema = ema_to_run(input)
+            if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
+            else: output_ema_logits = out_ema
 
-                output_regular = sigmoid(output_logits)
-                output_ema = sigmoid(output_ema_logits)
+            output_regular = sigmoid(output_logits)
+            output_ema = sigmoid(output_ema_logits)
 
         loss, _ = criterion(output_logits, target, epoch)
         loss_ema, _ = criterion(output_ema_logits, target, epoch)
@@ -591,14 +595,14 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
             with torch.no_grad():
-                with autocast():
-                    out = model_to_run(input)
-                    if isinstance(out, tuple): output_logits = out[0]
-                    else: output_logits = out
-                    
-                    out_ema = ema_to_run(input)
-                    if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
-                    else: output_ema_logits = out_ema
+                # 移除 autocast()
+                out = model_to_run(input)
+                if isinstance(out, tuple): output_logits = out[0]
+                else: output_logits = out
+                
+                out_ema = ema_to_run(input)
+                if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
+                else: output_ema_logits = out_ema
 
             loss, _ = criterion(output_logits, target, epoch)
             loss_ema, _ = criterion(output_ema_logits, target, epoch)
@@ -635,14 +639,14 @@ def init_validate(trainer, epoch: int):
         target = target.cuda(non_blocking=True)
         input = input.cuda(non_blocking=True)
         with torch.no_grad():
-            with autocast():
-                out = model_to_run(input)
-                if isinstance(out, tuple): output_logits = out[0]
-                else: output_logits = out
-                
-                out_ema = ema_to_run(input)
-                if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
-                else: output_ema_logits = out_ema
+            # 移除 autocast()
+            out = model_to_run(input)
+            if isinstance(out, tuple): output_logits = out[0]
+            else: output_logits = out
+            
+            out_ema = ema_to_run(input)
+            if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
+            else: output_ema_logits = out_ema
 
         loss = criterion(output_logits, target)
         loss_ema = criterion(output_ema_logits, target)
@@ -695,7 +699,9 @@ def train(trainer, dir) -> list:
     parameters = add_weight_decay(trainer.model, cfg.weight_decay)
     optimizer = torch.optim.Adam(params=parameters, lr=cfg.lr, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
-    scaler = GradScaler()
+    
+    # [修改 4] 方案二：停用 scaler，不再走缩放流程
+    # scaler = GradScaler() 
     
     steps_per_epoch = len(trainer.train_loader)
     accumulation_steps = getattr(cfg, 'accumulation_steps', 1)
@@ -740,14 +746,16 @@ def train(trainer, dir) -> list:
                 init_optimizer.zero_grad()
                 target = target.cuda(non_blocking=True)
                 image = input.cuda(non_blocking=True)
-                with autocast():
-                    out = trainer.model(image)
-                    if isinstance(out, tuple): out = out[0]
-                    output = out.float()
+                # 移除 autocast()
+                out = trainer.model(image)
+                if isinstance(out, tuple): out = out[0]
+                output = out.float()
                 loss = nn.BCEWithLogitsLoss()(output, target)
-                scaler.scale(loss).backward()
-                scaler.step(init_optimizer)
-                scaler.update()
+                
+                # [修改 5] 直接反向传播
+                loss.backward()
+                init_optimizer.step()
+                
                 trainer.ema.update(trainer.model)
 
                 if i % 100 == 0 and is_main_process():
@@ -798,11 +806,13 @@ def train(trainer, dir) -> list:
             
             loss = trainer.train(input, target, criterion, epoch, i)
             loss = loss / accumulation_steps
-            scaler.scale(loss).backward()
+            
+            # [修改 6] 直接反向传播，不再使用 scaler
+            loss.backward()
             
             if (i + 1) % accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
+                # [修改 7] 直接 optimizer.step()
+                optimizer.step()
                 optimizer.zero_grad()
                 trainer.ema.update(trainer.model)
             
@@ -919,8 +929,8 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
             with torch.no_grad():
+                # 移除 autocast()
                 out = model_to_run(input)
-                # [适配] 测试时也要处理 tuple 返回值
                 if isinstance(out, tuple): output_logits = out[0]
                 else: output_logits = out
                 output = sigmoid(output_logits)
@@ -961,6 +971,8 @@ def main():
     
     if is_main_process():
         logger.info(f'Seed {s}, DDP: {is_distributed}, GPU: {gpu_id}')
+        # [确认] TF32 开启状态
+        logger.info(f'TF32 Mode: Matmul={torch.backends.cuda.matmul.allow_tf32}')
     
     torch.use_deterministic_algorithms(False)
     torch.backends.cudnn.benchmark = True
