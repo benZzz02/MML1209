@@ -38,7 +38,7 @@ from model import (
     MMLSurgAdaptCoOp, MMLSurgAdaptDualCoOp, MMLSurgAdaptCoCoOp,
     MMLSurgAdaptCoOpFrozen, MMLSurgAdaptDualCoOpFrozen, MMLSurgAdaptCoCoOpFrozen, 
     CLIP_TextAttention, CLIP_TextAttentionCoOp, CLIPCoOpLoRA,
-    MMLSurgAdaptSCPNet, MMLSurgAdaptSCPNet_Plus 
+    MMLSurgAdaptSCPNet, MMLSurgAdaptSCPNet_Plus, MMLSurgAdaptSCPNet_PlusPlus 
 )
 from surgvlp import SurgAVLP, CBertViT
 
@@ -60,6 +60,24 @@ def setup_distributed():
         return True, gpu
     else:
         return False, 0
+
+# =============================================================================
+# Hill element-wise helper (用于 ignore mask 聚合)
+# =============================================================================
+def hill_elementwise_loss(logits, targets, hill_obj):
+    logits_margin = logits - hill_obj.margin
+    pred_pos = torch.sigmoid(logits_margin)
+    pred_neg = torch.sigmoid(logits)
+
+    pt = (1 - pred_pos) * targets + (1 - targets)
+    focal_weight = pt ** hill_obj.gamma
+
+    los_pos = targets * torch.log(pred_pos)
+    los_neg = (1 - targets) * -(hill_obj.lamb - pred_neg) * pred_neg ** 2
+
+    loss = -(los_pos + los_neg)
+    loss *= focal_weight
+    return loss
 
 # =============================================================================
 # 指标计算函数
@@ -392,6 +410,27 @@ class SCPNetTrainer():
                 external_adj_path=getattr(cfg, 'external_adj_path', None)
                                
             )
+        elif model_name == 'SCPNet_PlusPlus':
+            self.model = MMLSurgAdaptSCPNet_PlusPlus(
+                classnames,
+                clip_model,
+                alpha=getattr(cfg, 'sglc_alpha', 0.1),
+                sim_threshold=getattr(cfg, 'sim_threshold', 0.25),
+                top_k=getattr(cfg, 'top_k', 10),
+                external_adj_path=getattr(cfg, 'external_adj_path', None),
+                head_mask_path=getattr(cfg, 'head_mask_path', None),
+                tail_mask_path=getattr(cfg, 'tail_mask_path', None),
+                use_head_source_only=getattr(cfg, 'use_head_source_only', True),
+                enable_missing_topk=getattr(cfg, 'enable_missing_topk', True),
+                missing_topk_per_group=getattr(cfg, 'missing_topk', 1),
+                beta_missing=getattr(cfg, 'beta_missing', 1.0),
+                missing_score_mode=getattr(cfg, 'missing_score_mode', "prior_x_support"),
+                detach_probs=getattr(cfg, 'detach_probs', True),
+                use_ignore=getattr(cfg, 'use_ignore', True),
+                ignore_topk=getattr(cfg, 'ignore_topk', 1),
+                ignore_warmup=getattr(cfg, 'ignore_warmup', 0),
+                ignore_prior_th=getattr(cfg, 'ignore_prior_th', 0.0),
+            )
         else:
             raise NameError(f"Model '{model_name}' not recognized.")
 
@@ -450,20 +489,31 @@ class SCPNetTrainer():
         else:
             with autocast():
                 # [适配] SCPNet 系列：支持 (image, strong) 输入和多返回值
-                if cfg.model in ['SCPNet', 'SCPNet_Plus', 'MMLSurgAdaptSCPNet_Plus']:
-                    output_tuple = self.model(image, image_strong)
-                    
+                if cfg.model in ['SCPNet', 'SCPNet_Plus', 'MMLSurgAdaptSCPNet_Plus', 'SCPNet_PlusPlus']:
+                    if cfg.model == 'SCPNet_PlusPlus':
+                        output_tuple = self.model(image, image_strong, targets=target, epoch=epoch)
+                    else:
+                        output_tuple = self.model(image, image_strong)
+
+                    ignore_mask = None
                     if isinstance(output_tuple, tuple):
-                        logits, A_star, loss_cons_internal = output_tuple
+                        if len(output_tuple) == 4:
+                            logits, A_star, loss_cons_internal, ignore_mask = output_tuple
+                        elif len(output_tuple) == 3:
+                            logits, A_star, loss_cons_internal = output_tuple
+                        else:
+                            logits, A_star, loss_cons_internal = output_tuple[0], None, 0.0
                     else:
                         logits, A_star, loss_cons_internal = output_tuple, None, 0.0
                     
-                    # [修复 TypeError] 
-                    # 尝试传递 A_star，如果 Loss 不支持（如标准 Hill），则回退到普通调用
-                    try:
-                        loss_main, _ = criterion(logits, target, epoch, A_star=A_star)
-                    except TypeError:
-                        loss_main, _ = criterion(logits, target, epoch)
+                    if ignore_mask is not None and isinstance(criterion, Hill):
+                        loss_mat = hill_elementwise_loss(logits, target, criterion)
+                        loss_main = (loss_mat * ignore_mask).sum()
+                    else:
+                        try:
+                            loss_main, _ = criterion(logits, target, epoch, A_star=A_star)
+                        except TypeError:
+                            loss_main, _ = criterion(logits, target, epoch)
                     
                     w_cons = getattr(cfg, 'w_cons', 1.0)
                     loss = loss_main + w_cons * loss_cons_internal

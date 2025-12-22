@@ -1711,6 +1711,130 @@ class StructureGuidedLogitCompensation(nn.Module):
         return logits + self.alpha * self.scale * compensation
 
 # ==============================================================================
+# [创新点模块 B+] Structure-Guided Logit Compensation PlusPlus (SGLC++)
+# ==============================================================================
+class StructureGuidedLogitCompensationPlus(nn.Module):
+    def __init__(
+        self,
+        num_classes=110,
+        alpha=0.3,
+        phase_range=(0, 7),
+        view_range=(7, 10),
+        action_range=(10, 110),
+        head_source_mask=None,
+        tail_target_mask=None,
+        use_head_source_only=True,
+        enable_missing_topk=True,
+        missing_topk_per_group=1,
+        beta_missing=1.0,
+        missing_score_mode="prior_x_support",
+        detach_probs=True,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.alpha = alpha
+        self.use_head_source_only = use_head_source_only
+        self.enable_missing_topk = enable_missing_topk
+        self.missing_topk_per_group = missing_topk_per_group
+        self.beta_missing = beta_missing
+        self.missing_score_mode = missing_score_mode
+        self.detach_probs = detach_probs
+
+        self.phase_range = phase_range
+        self.view_range = view_range
+        self.action_range = action_range
+
+        self.register_buffer("head_source_mask", head_source_mask if head_source_mask is not None else None)
+        self.register_buffer("tail_target_mask", tail_target_mask if tail_target_mask is not None else None)
+
+        self.register_buffer("phase_mask", self._make_group_mask(phase_range))
+        self.register_buffer("view_mask", self._make_group_mask(view_range))
+        self.register_buffer("action_mask", self._make_group_mask(action_range))
+
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def _make_group_mask(self, group_range):
+        mask = torch.zeros(self.num_classes, dtype=torch.bool)
+        mask[group_range[0]:group_range[1]] = True
+        return mask
+
+    def _get_group_labels(self, anchor_idx):
+        device = anchor_idx.device
+        group_labels = torch.full_like(anchor_idx, 2)  # default action
+        phase_cond = (anchor_idx >= self.phase_range[0]) & (anchor_idx < self.phase_range[1])
+        view_cond = (anchor_idx >= self.view_range[0]) & (anchor_idx < self.view_range[1])
+        group_labels[phase_cond] = 0
+        group_labels[view_cond] = 1
+        return group_labels.to(device)
+
+    def forward(self, logits, A_star, targets=None):
+        if logits is None:
+            return logits
+
+        dtype = logits.dtype
+        device = logits.device
+
+        probs = torch.sigmoid(logits)
+        if self.detach_probs:
+            probs = probs.detach()
+
+        head_mask = self.head_source_mask
+        tail_mask = self.tail_target_mask
+
+        if head_mask is None:
+            head_mask = torch.ones(self.num_classes, device=device, dtype=dtype)
+        else:
+            head_mask = head_mask.to(device=device, dtype=dtype)
+
+        if tail_mask is None:
+            tail_mask = torch.ones(self.num_classes, device=device, dtype=dtype)
+        else:
+            tail_mask = tail_mask.to(device=device, dtype=dtype)
+
+        A_star = A_star.to(device=device, dtype=dtype)
+
+        probs_src = probs * head_mask if self.use_head_source_only else probs
+        support = torch.matmul(probs_src, A_star)
+
+        logits_out = logits + self.alpha * self.scale * (support * tail_mask)
+
+        if not (self.enable_missing_topk and targets is not None):
+            return logits_out
+
+        anchor_idx = targets.argmax(dim=1)
+        prior = A_star[anchor_idx]
+
+        if self.missing_score_mode == "prior":
+            score_all = prior
+        elif self.missing_score_mode == "support":
+            score_all = support
+        else:
+            score_all = prior * support
+
+        group_labels = self._get_group_labels(anchor_idx)
+        group_masks = [self.phase_mask.to(device=device), self.view_mask.to(device=device), self.action_mask.to(device=device)]
+
+        boost = torch.zeros_like(logits_out)
+        for gid, group_mask in enumerate(group_masks):
+            same_group = group_labels == gid
+            scores_group = score_all.masked_fill(~group_mask, float("-inf"))
+            if same_group.any():
+                scores_group = scores_group.clone()
+                scores_group[same_group] = float("-inf")
+
+            topk_vals, topk_idx = torch.topk(scores_group, k=self.missing_topk_per_group, dim=1)
+            valid = torch.isfinite(topk_vals) & (~same_group.unsqueeze(1))
+
+            if valid.any():
+                safe_topk = torch.where(valid, topk_vals, torch.zeros_like(topk_vals))
+                scaled = (self.alpha * self.beta_missing) * self.scale * safe_topk
+                scaled = scaled * valid.float()
+                boost = boost.scatter_add(1, topk_idx, scaled)
+
+        logits_out = logits_out + boost
+        return logits_out
+
+# ==============================================================================
 # [专用组件] 高级结构化提示器 (为新模型专用，不影响旧模型)
 # 包含：互斥Mask + Min-Max归一化 (配合 SGLC 效果最好)
 # ==============================================================================
@@ -1980,3 +2104,277 @@ class MMLSurgAdaptSCPNet_Plus(nn.Module):
         # 2. A_star: 用于 Loss 内部可能的调用或可视化
         # 3. loss_cons: 一致性 Loss，在 Trainer 外部加权求和
         return logits_final, self.A_star, loss_cons
+
+# ==============================================================================
+# [辅助模块] Relation-Guided Ignore Mask
+# ==============================================================================
+class RelationGuidedIgnoreMask(nn.Module):
+    def __init__(
+        self,
+        num_classes,
+        ranges,
+        ignore_topk_per_missing_group=1,
+        warmup_epochs=0,
+        prior_threshold=0.0,
+        score_mode="prior",
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_topk_per_missing_group = ignore_topk_per_missing_group
+        self.warmup_epochs = warmup_epochs
+        self.prior_threshold = prior_threshold
+        self.score_mode = score_mode
+
+        self.register_buffer(
+            "group_masks",
+            torch.stack(
+                [
+                    self._make_group_mask(ranges[0], num_classes),
+                    self._make_group_mask(ranges[1], num_classes),
+                    self._make_group_mask(ranges[2], num_classes),
+                ],
+                dim=0,
+            ),
+        )
+
+    def _make_group_mask(self, group_range, num_classes):
+        mask = torch.zeros(num_classes, dtype=torch.bool)
+        mask[group_range[0] : group_range[1]] = True
+        return mask
+
+    def _get_group_labels(self, anchor_idx, ranges):
+        group_labels = torch.full_like(anchor_idx, 2)
+        phase_range, view_range, _ = ranges
+        phase_cond = (anchor_idx >= phase_range[0]) & (anchor_idx < phase_range[1])
+        view_cond = (anchor_idx >= view_range[0]) & (anchor_idx < view_range[1])
+        group_labels[phase_cond] = 0
+        group_labels[view_cond] = 1
+        return group_labels
+
+    def forward(self, A_star, targets, epoch, logits=None, ranges=None):
+        if epoch < self.warmup_epochs:
+            return torch.ones_like(targets, dtype=A_star.dtype, device=targets.device)
+
+        if ranges is None:
+            ranges = [(0, 7), (7, 10), (10, self.num_classes)]
+
+        anchor_idx = targets.argmax(dim=1)
+        prior = A_star[anchor_idx].to(device=targets.device)
+
+        if self.score_mode == "prior_x_pred" and logits is not None:
+            score_all = prior * torch.sigmoid(logits).detach()
+        else:
+            score_all = prior
+
+        mask = torch.ones_like(score_all)
+        group_labels = self._get_group_labels(anchor_idx, ranges)
+        group_masks = self.group_masks.to(device=targets.device)
+
+        for gid in range(3):
+            same_group = group_labels == gid
+            scores_group = score_all.masked_fill(~group_masks[gid], float("-inf"))
+            if same_group.any():
+                scores_group = scores_group.clone()
+                scores_group[same_group] = float("-inf")
+
+            topk_vals, topk_idx = torch.topk(scores_group, k=self.ignore_topk_per_missing_group, dim=1)
+            valid = torch.isfinite(topk_vals) & (topk_vals > self.prior_threshold) & (~same_group.unsqueeze(1))
+            if valid.any():
+                mask = mask.scatter(1, topk_idx, (~valid).float())
+
+        return mask
+
+# ==============================================================================
+# [全功能新模型] MMLSurgAdaptSCPNet_PlusPlus
+# ==============================================================================
+class MMLSurgAdaptSCPNet_PlusPlus(nn.Module):
+    def __init__(
+        self,
+        classnames,
+        clip_model,
+        alpha=0.1,
+        sim_threshold=0.25,
+        top_k=10,
+        external_adj_path=None,
+        head_mask_path=None,
+        tail_mask_path=None,
+        use_head_source_only=True,
+        enable_missing_topk=True,
+        missing_topk_per_group=1,
+        beta_missing=1.0,
+        missing_score_mode="prior_x_support",
+        detach_probs=True,
+        use_ignore=True,
+        ignore_topk=1,
+        ignore_warmup=0,
+        ignore_prior_th=0.0,
+    ):
+        super().__init__()
+
+        self.num_classes = len(classnames)
+        self.use_ignore = use_ignore
+
+        self.prompt_learner = PromptLearner(classnames, clip_model)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+        try:
+            feat_dim = clip_model.text_projection.shape[1]
+        except:
+            feat_dim = 1024
+
+        A_star = None
+        if external_adj_path and os.path.exists(external_adj_path):
+            print(f"[MMLSurgAdaptSCPNet_PlusPlus] Loading external adjacency matrix from: {external_adj_path}")
+            try:
+                adj_numpy = np.load(external_adj_path)
+                A_star = torch.from_numpy(adj_numpy).to(self.dtype)
+                if A_star.shape[0] != len(classnames) or A_star.shape[1] != len(classnames):
+                    print(f"Warning: External matrix shape {A_star.shape} does not match class count {len(classnames)}!")
+                self.spp = None
+            except Exception as e:
+                print(f"Error loading external matrix: {e}")
+                print("Falling back to internal generation...")
+                A_star = None
+
+        if A_star is None:
+            print("[MMLSurgAdaptSCPNet_PlusPlus] Generating adjacency matrix using StructuredPriorPrompter...")
+            self.spp = StructuredPriorPrompter_Advanced(
+                classnames,
+                clip_model,
+                threshold=sim_threshold,
+                top_k=top_k,
+            )
+            A_star = self.spp()
+
+        self.register_buffer("A_star", A_star)
+        self.sam = SemanticAssociationModule(feat_dim, feat_dim)
+        self.tgmi = TextGuidedMultiGranularityInteraction(feat_dim)
+
+        head_mask = self._load_mask(head_mask_path, "head_mask")
+        tail_mask = self._load_mask(tail_mask_path, "tail_mask")
+
+        self.sglc_plus = StructureGuidedLogitCompensationPlus(
+            num_classes=len(classnames),
+            alpha=alpha,
+            head_source_mask=head_mask,
+            tail_target_mask=tail_mask,
+            use_head_source_only=use_head_source_only,
+            enable_missing_topk=enable_missing_topk,
+            missing_topk_per_group=missing_topk_per_group,
+            beta_missing=beta_missing,
+            missing_score_mode=missing_score_mode,
+            detach_probs=detach_probs,
+        )
+
+        self.ignore_generator = RelationGuidedIgnoreMask(
+            num_classes=len(classnames),
+            ranges=[(0, 7), (7, 10), (10, len(classnames))],
+            ignore_topk_per_missing_group=ignore_topk,
+            warmup_epochs=ignore_warmup,
+            prior_threshold=ignore_prior_th,
+            score_mode=getattr(cfg, "ignore_score_mode", "prior"),
+        )
+
+        self.consistency_criterion = nn.MSELoss()
+
+    def _load_mask(self, mask_path, name):
+        if mask_path is None:
+            return None
+        if not os.path.exists(mask_path):
+            print(f"[MMLSurgAdaptSCPNet_PlusPlus] {name} path not found: {mask_path}")
+            return None
+        try:
+            mask_np = np.load(mask_path)
+        except Exception as e:
+            print(f"[MMLSurgAdaptSCPNet_PlusPlus] Failed to load {name} from {mask_path}: {e}")
+            return None
+
+        if mask_np.shape[0] != self.num_classes:
+            print(f"[MMLSurgAdaptSCPNet_PlusPlus] {name} shape {mask_np.shape} mismatch with num_classes {self.num_classes}")
+            return None
+
+        mask_tensor = torch.from_numpy(mask_np).to(self.dtype)
+        if mask_tensor.dim() != 1 or mask_tensor.shape[0] != self.num_classes:
+            print(f"[MMLSurgAdaptSCPNet_PlusPlus] {name} must be 1-D with length {self.num_classes}")
+            return None
+
+        return mask_tensor
+
+    def encode_image_with_spatial(self, image):
+        x = self.image_encoder.conv1(image.type(self.dtype))
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
+
+        cls_token = self.image_encoder.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+        )
+        x = torch.cat([cls_token, x], dim=1)
+        x = x + self.image_encoder.positional_embedding.to(x.dtype)
+        x = self.image_encoder.ln_pre(x)
+
+        x = x.permute(1, 0, 2)
+        x = self.image_encoder.transformer(x)
+        x = x.permute(1, 0, 2)
+
+        global_feat = self.image_encoder.ln_post(x[:, 0, :])
+
+        if self.image_encoder.proj is not None:
+            global_feat = global_feat @ self.image_encoder.proj
+            spatial_feats = x[:, 1:, :] @ self.image_encoder.proj
+        else:
+            spatial_feats = x[:, 1:, :]
+
+        return global_feat, spatial_feats
+
+    def forward(self, image, image_strong=None, targets=None, epoch=0):
+        child_prompts = self.prompt_learner()
+        Z = self.text_encoder(child_prompts, self.tokenized_prompts)
+
+        row_sum = self.A_star.sum(dim=1, keepdim=True)
+        A_gcn = self.A_star / (row_sum + 1e-12)
+
+        text_features_gcn = self.sam(Z, A_gcn)
+        text_features_gcn = text_features_gcn / text_features_gcn.norm(dim=-1, keepdim=True)
+
+        img_global, img_spatial = self.encode_image_with_spatial(image)
+        img_global = img_global / img_global.norm(dim=-1, keepdim=True)
+        img_spatial = img_spatial / img_spatial.norm(dim=-1, keepdim=True)
+
+        B = image.shape[0]
+        text_features_batch = text_features_gcn.unsqueeze(0).expand(B, -1, -1)
+
+        text_features_refined = self.tgmi(img_spatial, text_features_batch)
+        text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
+
+        logits_weak = 10 * torch.einsum("bd, bnd -> bn", img_global, text_features_refined)
+
+        logits_final = self.sglc_plus(logits_weak, self.A_star, targets=targets)
+
+        loss_cons = torch.tensor(0.0).to(image.device)
+
+        if self.training and image_strong is not None:
+            img_global_s, img_spatial_s = self.encode_image_with_spatial(image_strong)
+            img_global_s = img_global_s / img_global_s.norm(dim=-1, keepdim=True)
+            img_spatial_s = img_spatial_s / img_spatial_s.norm(dim=-1, keepdim=True)
+
+            text_features_s = self.tgmi(img_spatial_s, text_features_batch)
+            text_features_s = text_features_s / text_features_s.norm(dim=-1, keepdim=True)
+
+            logits_strong = 10 * torch.einsum("bd, bnd -> bn", img_global_s, text_features_s)
+
+            loss_cons = self.consistency_criterion(logits_strong, logits_weak.detach())
+
+        ignore_mask = None
+        if self.training and targets is not None and self.use_ignore:
+            ignore_mask = self.ignore_generator(
+                A_star=self.A_star.to(image.device, dtype=logits_final.dtype),
+                targets=targets,
+                epoch=epoch,
+                logits=logits_final,
+                ranges=[(0, 7), (7, 10), (10, self.num_classes)],
+            )
+
+        return logits_final, self.A_star, loss_cons, ignore_mask
