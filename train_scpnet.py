@@ -388,7 +388,9 @@ class SCPNetTrainer():
                 clip_model,
                 alpha=getattr(cfg, 'sglc_alpha', 0.1),         
                 sim_threshold=getattr(cfg, 'sim_threshold', 0.25), 
-                top_k=getattr(cfg, 'top_k', 10)               
+                top_k=getattr(cfg, 'top_k', 10),
+                external_adj_path=getattr(cfg, 'external_adj_path', None)
+                               
             )
         else:
             raise NameError(f"Model '{model_name}' not recognized.")

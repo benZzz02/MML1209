@@ -1,5 +1,5 @@
 from collections import OrderedDict
-
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -1800,7 +1800,7 @@ class StructuredPriorPrompter_Advanced(nn.Module):
 # 集成：GCN + TGMI (小目标) + SGLC (长尾) + Consistency (鲁棒性)
 # ==============================================================================
 class MMLSurgAdaptSCPNet_Plus(nn.Module):
-    def __init__(self, classnames, clip_model, alpha=0.1, sim_threshold=0.25, top_k=10):
+    def __init__(self, classnames, clip_model, alpha=0.1, sim_threshold=0.25, top_k=10, external_adj_path=None):
         super().__init__()
         
         # --- 1. 基础组件 (复用原有逻辑) ---
@@ -1816,15 +1816,44 @@ class MMLSurgAdaptSCPNet_Plus(nn.Module):
         except:
             feat_dim = 1024
 
-        # --- 2. GCN 部分 (使用高级版 A*) ---
-        # [修改] 这里传入 top_k 和 sim_threshold，确保 A* 矩阵的稀疏度和质量可控
-        self.spp = StructuredPriorPrompter_Advanced(
-            classnames, 
-            clip_model, 
-            threshold=sim_threshold, 
-            top_k=top_k
-        )
-        self.register_buffer("A_star", self.spp()) 
+        # --- 2. GCN 部分 (构建邻接矩阵 A_star) ---
+        # [修改逻辑] 优先检查是否提供了外部矩阵路径
+        A_star = None
+        
+        if external_adj_path and os.path.exists(external_adj_path):
+            print(f"[MMLSurgAdaptSCPNet_Plus] Loading external adjacency matrix from: {external_adj_path}")
+            try:
+                # 加载 npy 文件
+                adj_numpy = np.load(external_adj_path)
+                # 转换为 Tensor，并确保类型与模型一致 (通常是 float16 或 float32)
+                A_star = torch.from_numpy(adj_numpy).to(self.dtype)
+                
+                # 简单的维度检查 (可选)
+                if A_star.shape[0] != len(classnames) or A_star.shape[1] != len(classnames):
+                    print(f"Warning: External matrix shape {A_star.shape} does not match class count {len(classnames)}!")
+                
+                # 如果使用了外部矩阵，就不需要初始化 spp 了，节省显存
+                self.spp = None 
+                
+            except Exception as e:
+                print(f"Error loading external matrix: {e}")
+                print("Falling back to internal generation...")
+                A_star = None # 触发下方的 else 逻辑
+
+        if A_star is None:
+            # [原有逻辑] 使用高级版 A* 生成器
+            # 这里传入 top_k 和 sim_threshold，确保 A* 矩阵的稀疏度和质量可控
+            print("[MMLSurgAdaptSCPNet_Plus] Generating adjacency matrix using StructuredPriorPrompter...")
+            self.spp = StructuredPriorPrompter_Advanced(
+                classnames, 
+                clip_model, 
+                threshold=sim_threshold, 
+                top_k=top_k
+            )
+            A_star = self.spp()
+
+        # 注册为 buffer，确保它会随模型一起移动到 GPU (self.A_star)
+        self.register_buffer("A_star", A_star) 
         
         # 复用 SemanticAssociationModule (GCN)
         self.sam = SemanticAssociationModule(feat_dim, feat_dim)
@@ -1887,6 +1916,7 @@ class MMLSurgAdaptSCPNet_Plus(nn.Module):
         Z = self.text_encoder(child_prompts, self.tokenized_prompts)
         
         # GCN 归一化处理 (Row-Sum)
+        # 确保分母不为0
         row_sum = self.A_star.sum(dim=1, keepdim=True)
         A_gcn = self.A_star / (row_sum + 1e-12)
         
