@@ -1,0 +1,97 @@
+# ==============================================================================
+# Training Basics
+# ==============================================================================
+n_ctx: 4
+model: SCPNet_PlusPlus                 # 新模型名（注意大小写）
+model_name: scpnet
+backbone: ViT-L/14
+
+# 路径配置
+checkpoint: cholec_vals/scpnet_plus_plus_innovations_sp
+log_file: scpnet_plus_plus_innovations_sp.txt
+dir: trial_scpnet_plus_plus_innovations_sp
+
+# 优化器参数
+batch_size: 15
+accumulation_steps: 2
+lr: 1e-5
+epochs: 12
+change_epoch: 1
+init_epochs: 5
+init_lr: 1e-5
+seed: 0
+
+# ==============================================================================
+# Loss Function Strategy
+# ==============================================================================
+loss: Hill
+
+# ==============================================================================
+# [Innovation 1] Structure-Aware Prior (GCN & SPP Advanced)
+# ==============================================================================
+gcn_layers: 3
+reweight_p: 0.5
+top_k: 30
+sim_threshold: 0.5
+t_smooth: 0.07
+sglc_alpha: 0.5
+external_adj_path: matrix.npy          # 可选；留空则用 SPP 生成
+
+# SGLC++ 细粒度参数
+use_head_source_only: True
+enable_missing_topk: True
+missing_topk: 1
+beta_missing: 1.0
+missing_score_mode: prior_x_support     # 可选：prior/support/prior_x_support
+detach_probs: True
+head_mask_path: null                    # 如有 npy 路径则填写
+tail_mask_path: null
+
+# ==============================================================================
+# [Innovation 2] Consistency Regularization
+# ==============================================================================
+use_consistency: True
+w_cons: 0.1
+cons_flip_prob: 0.5
+cons_brightness_range: 0.9
+cons_brightness_min: 0.2
+cons_gray_prob: 0.5
+
+# ==============================================================================
+# Ignore Mask（PlusPlus 新增）
+# ==============================================================================
+use_ignore: True
+ignore_topk: 1
+ignore_warmup: 0
+ignore_prior_th: 0.0
+ignore_score_mode: prior_x_pred         # 可选：prior / prior_x_pred
+
+# ==============================================================================
+# Dataset & Labels
+# ==============================================================================
+num_classes: 110
+child_num: 110
+child_n_ctx: 4
+child_ctx_init: a photo
+relation_file: cholec/word2vec_similarity_matrix.npy
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+label_file: label_jsons/data1.json
+
+val_sp: True
+val_methods: ['pp_map', 'pp_loss', 'sp_loss']
+perform_init: False
+init_train_file: triplet_train_labels.json
+init_val_file: triplet_val_labels.json
+ratio: 1
+image_size: 224
+use_lfile: False
+getitem: False
+partial: False
+
+# ==============================================================================
+# Testing
+# ==============================================================================
+ckpt: temp.ckpt
+test_dir: trial_test_scpnet_plus_plus_innovations_sp
+test_loss: Hill
