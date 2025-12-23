@@ -619,24 +619,24 @@ class SCPNetTrainer():
 
             # [适配] 旧模型逻辑
             else:
-                    if need_consistency:
-                        combined = torch.cat([image, image_strong], dim=0)
-                        combined_output = self.model(combined).float()
-                        
-                        batch_size = image.shape[0]
-                        output_clean = combined_output[:batch_size]
-                        output_aug = combined_output[batch_size:]
-                        
-                        if hasattr(criterion, 'cons_weight'):
-                            loss, _ = criterion(output_clean, output_aug, target, epoch)
-                        else:
-                            loss, _ = criterion(output_clean, target, epoch)
+                if need_consistency:
+                    combined = torch.cat([image, image_strong], dim=0)
+                    combined_output = self.model(combined).float()
+                    
+                    batch_size = image.shape[0]
+                    output_clean = combined_output[:batch_size]
+                    output_aug = combined_output[batch_size:]
+                    
+                    if hasattr(criterion, 'cons_weight'):
+                        loss, _ = criterion(output_clean, output_aug, target, epoch)
                     else:
-                        output = self.model(image).float()
-                        if hasattr(criterion, 'cons_weight'):
-                            loss, _ = criterion(output, None, target, epoch)
-                        else:
-                            loss, _ = criterion(output, target, epoch)
+                        loss, _ = criterion(output_clean, target, epoch)
+                else:
+                    output = self.model(image).float()
+                    if hasattr(criterion, 'cons_weight'):
+                        loss, _ = criterion(output, None, target, epoch)
+                    else:
+                        loss, _ = criterion(output, target, epoch)
             
         return loss
 
