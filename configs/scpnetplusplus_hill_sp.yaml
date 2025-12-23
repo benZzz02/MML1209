@@ -12,8 +12,8 @@ log_file: scpnet_plus_plus_innovations_sp.txt
 dir: trial_scpnet_plus_plus_innovations_sp
 
 # 优化器参数
-batch_size: 15
-accumulation_steps: 2
+batch_size: 10
+accumulation_steps: 4
 lr: 1e-5
 epochs: 12
 change_epoch: 1

@@ -139,7 +139,7 @@ def debug_dump_eval(
         },
     }
     overview.update(extra_dict)
-    logger.info(f"[DebugDump][{split_name}][overview] {json.dumps(overview, ensure_ascii=False)}")
+    logger.info(f"[DebugDump][{split_name}][overview] {json.dumps(overview, ensure_ascii=False,default=str)}")
 
     datasets = ["cholec80", "endoscapes", "cholect50"]
     for dataset in datasets:
@@ -153,7 +153,7 @@ def debug_dump_eval(
         }
         if mask_sum == 0:
             coverage["video_id_samples"] = [str(x) for x in video_ids_np[:20]]
-        logger.info(f"[DebugDump][{split_name}][mask] {json.dumps(coverage, ensure_ascii=False)}")
+        logger.info(f"[DebugDump][{split_name}][mask] {json.dumps(coverage, ensure_ascii=False,default=str)}")
 
     if sample_indices is None:
         if len(labels_np) == 0:
@@ -175,7 +175,7 @@ def debug_dump_eval(
             "pred_topk": [(int(i), float(pred[i])) for i in topk_idx],
             "pred_scores_at_label1": [(int(i), float(pred[i])) for i in label_pos_idx[:30]],
         }
-        logger.info(f"[DebugDump][{split_name}][sample] {json.dumps(detail, ensure_ascii=False)}")
+        logger.info(f"[DebugDump][{split_name}][sample] {json.dumps(detail, ensure_ascii=False,default=str)}")
 
     snapshot = {
         "labels_head": labels_np.astype(np.float32)[:5, :10].tolist(),
@@ -183,7 +183,7 @@ def debug_dump_eval(
         "labels_sum_axis0_head": labels_np.sum(axis=0).astype(np.float32)[:10].tolist(),
         "preds_mean_axis0_head": preds_np.mean(axis=0).astype(np.float32)[:10].tolist(),
     }
-    logger.info(f"[DebugDump][{split_name}][snapshot] {json.dumps(snapshot, ensure_ascii=False)}")
+    logger.info(f"[DebugDump][{split_name}][snapshot] {json.dumps(snapshot, ensure_ascii=False,default=str)}")
 
 
 class AverageMeter(object):
