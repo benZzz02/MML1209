@@ -1129,8 +1129,13 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
 
         ckpt_type = "ema" if "ema" in filename.lower() else "regular"
         logger.info(f"[Test] ckpt_path={ckpt_path}, ckpt_type={ckpt_type}")
+        # 将同一 checkpoint 同步到 regular/EMA 两条推理路径，保持测试与验证的评估口径一致
+        ema_to_run = trainer.ema.module if hasattr(trainer.ema, 'module') else trainer.ema
+        ema_to_run.load_state_dict(state_dict, strict=True)
+        ema_to_run.eval()
 
         preds, targets, all_vids = [], [], []
+        preds_ema = []
         for i, (input, target, vid) in enumerate(trainer.test_loader):
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
@@ -1141,12 +1146,18 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
                 else: output_logits = out
                 output = sigmoid(output_logits)
 
+                out_ema = ema_to_run(input)
+                if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
+                else: output_ema_logits = out_ema
+                output_ema = sigmoid(output_ema_logits)
             preds.append(output.cpu().numpy())
+            preds_ema.append(output_ema.cpu().numpy())
             targets.append(target.cpu().numpy())
             all_vids.extend(vid)
 
         all_labels = np.concatenate(targets, axis=0)
         all_predictions = np.concatenate(preds, axis=0)
+        all_predictions_ema = np.concatenate(preds_ema, axis=0)
         all_vids_np = np.array(all_vids)
         method_name = filename.replace('.ckpt', '')
         calculate_metrics(
@@ -1159,6 +1170,8 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
             method=f"{method_name}|ckpt_type={ckpt_type}|path={ckpt_path}",
         )
         logger.info(f"[Test][{method_name}] mAP: {mAP(all_labels, all_predictions):.2f}")
+        calculate_metrics(all_labels, all_predictions, all_predictions_ema, all_vids_np, True, dir, method=method_name)
+        logger.info(f"[Test][{method_name}] mAP regular: {mAP(all_labels, all_predictions):.2f}, mAP EMA: {mAP(all_labels, all_predictions_ema):.2f}")
         processed_epochs.add(epoch_id)
         logger.info(f"Finished testing {method_name}")
 
