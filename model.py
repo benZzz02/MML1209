@@ -1729,6 +1729,7 @@ class StructureGuidedLogitCompensationPlus(nn.Module):
         beta_missing=1.0,
         missing_score_mode="prior_x_support",
         detach_probs=True,
+        debug_mode=False,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -1739,6 +1740,8 @@ class StructureGuidedLogitCompensationPlus(nn.Module):
         self.beta_missing = beta_missing
         self.missing_score_mode = missing_score_mode
         self.detach_probs = detach_probs
+        self.debug_mode = debug_mode
+        self.debug_cache = {}
 
         self.phase_range = phase_range
         self.view_range = view_range
@@ -1774,6 +1777,9 @@ class StructureGuidedLogitCompensationPlus(nn.Module):
         dtype = logits.dtype
         device = logits.device
 
+        debug_enabled = self.debug_mode and self.training
+        self.debug_cache = {}
+
         probs = torch.sigmoid(logits)
         if self.detach_probs:
             probs = probs.detach()
@@ -1798,11 +1804,29 @@ class StructureGuidedLogitCompensationPlus(nn.Module):
 
         logits_out = logits + self.alpha * self.scale * (support * tail_mask)
 
+        if debug_enabled:
+            self.debug_cache = {
+                "logits_in": logits.detach(),
+                "support": support.detach(),
+                "head_mask": head_mask.detach(),
+                "tail_mask": tail_mask.detach(),
+                "delta_logits": (logits_out - logits).detach(),
+                "anchor_from_targets": targets is not None,
+                "anchor_idx": None,
+                "score_all": None,
+                "topk_idx": None,
+                "topk_vals": None,
+                "boost": None,
+            }
+
         if not (self.enable_missing_topk and targets is not None):
             return logits_out
 
         anchor_idx = targets.argmax(dim=1)
         prior = A_star[anchor_idx]
+
+        if debug_enabled:
+            self.debug_cache["anchor_idx"] = anchor_idx.detach()
 
         if self.missing_score_mode == "prior":
             score_all = prior
@@ -1810,6 +1834,9 @@ class StructureGuidedLogitCompensationPlus(nn.Module):
             score_all = support
         else:
             score_all = prior * support
+
+        if debug_enabled:
+            self.debug_cache["score_all"] = score_all.detach()
 
         group_labels = self._get_group_labels(anchor_idx)
         group_masks = [self.phase_mask.to(device=device), self.view_mask.to(device=device), self.action_mask.to(device=device)]
@@ -1831,7 +1858,15 @@ class StructureGuidedLogitCompensationPlus(nn.Module):
                 scaled = scaled * valid.float()
                 boost = boost.scatter_add(1, topk_idx, scaled)
 
+            if debug_enabled:
+                self.debug_cache["topk_idx"] = topk_idx.detach()
+                self.debug_cache["topk_vals"] = topk_vals.detach()
+
         logits_out = logits_out + boost
+
+        if debug_enabled:
+            self.debug_cache["boost"] = boost.detach()
+            self.debug_cache["delta_logits"] = (logits_out - logits).detach()
         return logits_out
 
 # ==============================================================================
@@ -2204,6 +2239,7 @@ class MMLSurgAdaptSCPNet_PlusPlus(nn.Module):
         beta_missing=1.0,
         missing_score_mode="prior_x_support",
         detach_probs=True,
+        debug_mode=False,
         use_ignore=True,
         ignore_topk=1,
         ignore_warmup=0,
@@ -2268,6 +2304,7 @@ class MMLSurgAdaptSCPNet_PlusPlus(nn.Module):
             beta_missing=beta_missing,
             missing_score_mode=missing_score_mode,
             detach_probs=detach_probs,
+            debug_mode=debug_mode,
         )
 
         self.ignore_generator = RelationGuidedIgnoreMask(
