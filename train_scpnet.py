@@ -616,129 +616,25 @@ class SCPNetTrainer():
                                 }
 
                             logger.info(f"[DEBUG][SCPNet_PlusPlus][step {epoch_i}] {msg}")
-
-                # [适配] 旧模型逻辑
-                w_cons = getattr(cfg, 'w_cons', 1.0)
-                loss = loss_main + w_cons * loss_cons_internal
-
-                debug_interval = getattr(cfg, 'debug_interval', 100)
-                if (
-                    cfg.model == 'SCPNet_PlusPlus'
-                    and debug_interval > 0
-                    and is_main_process()
-                    and (epoch_i % debug_interval == 0)
-                ):
-                    with torch.no_grad():
-                        model_ref = self.model_unwrap
-                        A_star_cur = model_ref.A_star.detach()
-                        row_sum = A_star_cur.sum(dim=1, keepdim=True)
-                        A_gcn_cur = A_star_cur / (row_sum + 1e-12)
-
-                        cache = getattr(model_ref.sglc_plus, "debug_cache", {})
-                        support = cache.get("support")
-                        delta_logits = cache.get("delta_logits")
-                        topk_idx = cache.get("topk_idx")
-                        topk_vals = cache.get("topk_vals")
-                        boost = cache.get("boost")
-
-                        head_mask = cache.get("head_mask", model_ref.sglc_plus.head_source_mask)
-                        tail_mask = cache.get("tail_mask", model_ref.sglc_plus.tail_target_mask)
-                        head_mask = head_mask if head_mask is not None else torch.ones_like(A_star_cur[0])
-                        tail_mask = tail_mask if tail_mask is not None else torch.ones_like(A_star_cur[0])
-
-                        def _group_sums(mask):
-                            return (
-                                mask[0:7].sum().item(),
-                                mask[7:10].sum().item(),
-                                mask[10:].sum().item(),
-                            )
-
-                        msg = {
-                            "A_star": {
-                                "max": A_star_cur.max().item(),
-                                "mean": A_star_cur.mean().item(),
-                                "min": A_star_cur.min().item(),
-                                "row_sum_mean": row_sum.mean().item(),
-                                "gcn_max": A_gcn_cur.max().item(),
-                                "gcn_mean": A_gcn_cur.mean().item(),
-                            },
-                            "head_mask_sum": {"all": head_mask.sum().item(), "groups": _group_sums(head_mask)},
-                            "tail_mask_sum": {"all": tail_mask.sum().item(), "groups": _group_sums(tail_mask)},
-                            "loss": {
-                                "loss_main": float(loss_main.detach().item()),
-                                "loss_cons": float(loss_cons_internal.detach().item()),
-                                "w_cons": float(w_cons),
-                                "cons_share": float((w_cons * loss_cons_internal.detach()).item()),
-                            },
-                        }
-
-                        if support is not None:
-                            msg["support"] = {
-                                "mean": support.mean().item(),
-                                "max": support.max().item(),
-                            }
-                        if delta_logits is not None:
-                            msg["delta_logits"] = {
-                                "mean": delta_logits.mean().item(),
-                                "max": delta_logits.max().item(),
-                            }
-                        if topk_vals is not None and delta_logits is not None and topk_idx is not None:
-                            valid_boost = torch.isfinite(topk_vals)
-                            sel_delta = torch.zeros_like(topk_vals)
-                            if valid_boost.any():
-                                sel_delta = delta_logits.gather(1, topk_idx) * valid_boost.float()
-                            msg["missing_topk"] = {
-                                "avg_score": topk_vals[valid_boost].mean().item() if valid_boost.any() else 0.0,
-                                "avg_delta": sel_delta[valid_boost].mean().item() if valid_boost.any() else 0.0,
-                            }
-                        if boost is not None:
-                            msg["boost_sum"] = boost.sum(dim=1).mean().item()
-
-                        if ignore_mask is not None:
-                            zeros_per_sample = (ignore_mask < 0.5).sum(dim=1).float()
-                            msg["ignore_mask"] = {
-                                "mean": ignore_mask.mean().item(),
-                                "zeros_per_sample": zeros_per_sample.mean().item(),
-                                "min_zero_cnt": zeros_per_sample.min().item(),
-                                "max_zero_cnt": zeros_per_sample.max().item(),
-                            }
-
-                        anchor_from_targets = cache.get("anchor_from_targets", target is not None)
-                        anchor_idx = cache.get("anchor_idx")
-                        if anchor_idx is not None:
-                            anchor_idx = anchor_idx.detach()
-                            group_labels = torch.full_like(anchor_idx, 2)
-                            group_labels[(anchor_idx >= 0) & (anchor_idx < 7)] = 0
-                            group_labels[(anchor_idx >= 7) & (anchor_idx < 10)] = 1
-                            msg["anchor"] = {
-                                "from_targets": bool(anchor_from_targets),
-                                "phase_frac": float((group_labels == 0).float().mean().item()),
-                                "view_frac": float((group_labels == 1).float().mean().item()),
-                                "action_frac": float((group_labels == 2).float().mean().item()),
-                            }
-
-                        logger.info(f"[DEBUG][SCPNet_PlusPlus][step {epoch_i}] {msg}")
-
-            # [适配] 旧模型逻辑
-            else:
-                if need_consistency:
-                    combined = torch.cat([image, image_strong], dim=0)
-                    combined_output = self.model(combined).float()
-                    
-                    batch_size = image.shape[0]
-                    output_clean = combined_output[:batch_size]
-                    output_aug = combined_output[batch_size:]
-                    
-                    if hasattr(criterion, 'cons_weight'):
-                        loss, _ = criterion(output_clean, output_aug, target, epoch)
-                    else:
-                        loss, _ = criterion(output_clean, target, epoch)
                 else:
-                    output = self.model(image).float()
-                    if hasattr(criterion, 'cons_weight'):
-                        loss, _ = criterion(output, None, target, epoch)
+                    if need_consistency:
+                        combined = torch.cat([image, image_strong], dim=0)
+                        combined_output = self.model(combined).float()
+                        
+                        batch_size = image.shape[0]
+                        output_clean = combined_output[:batch_size]
+                        output_aug = combined_output[batch_size:]
+                        
+                        if hasattr(criterion, 'cons_weight'):
+                            loss, _ = criterion(output_clean, output_aug, target, epoch)
+                        else:
+                            loss, _ = criterion(output_clean, target, epoch)
                     else:
-                        loss, _ = criterion(output, target, epoch)
+                        output = self.model(image).float()
+                        if hasattr(criterion, 'cons_weight'):
+                            loss, _ = criterion(output, None, target, epoch)
+                        else:
+                            loss, _ = criterion(output, target, epoch)
             
         return loss
 
