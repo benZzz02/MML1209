@@ -52,6 +52,139 @@ def mAP(targs, preds):
         ap[k] = average_precision(scores, targets)
     return 100 * ap.mean()
 
+def debug_dump_eval(
+    split_name: str,
+    labels,
+    preds,
+    video_ids,
+    loader_name: str,
+    extra_dict=None,
+    sample_indices=None,
+    topk: int = 10,
+):
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    import json
+
+    labels_np = np.asarray(labels)
+    preds_np = np.asarray(preds)
+    video_ids_np = np.asarray(video_ids)
+    extra_dict = extra_dict or {}
+
+    assert labels_np.shape == preds_np.shape, f"Shape mismatch labels{labels_np.shape} vs preds{preds_np.shape}"
+
+    # Label checks
+    unique_labels = np.unique(labels_np)
+    non_binary_mask = ~np.isin(unique_labels, [0, 1])
+    non_binary_count = int(np.count_nonzero(non_binary_mask))
+    if non_binary_count > 0:
+        bad_vals = unique_labels[non_binary_mask]
+        raise RuntimeError(f"[{split_name}] Labels contain non-binary values: {bad_vals[:20]}")
+
+    # Pred checks
+    if not np.isfinite(preds_np).all():
+        nan_count = np.isnan(preds_np).sum()
+        inf_count = np.isinf(preds_np).sum()
+        raise RuntimeError(f"[{split_name}] preds contain NaN({nan_count}) or Inf({inf_count})")
+    pred_min, pred_max = preds_np.min(), preds_np.max()
+    if pred_min < 0.0 or pred_max > 1.0:
+        raise RuntimeError(f"[{split_name}] preds outside [0,1]: min={pred_min}, max={pred_max}")
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+    top1_scores = preds_np.max(axis=1)
+    pos_counts = (preds_np > 0.5).sum(axis=1)
+
+    overview = {
+        "split": split_name,
+        "loader": loader_name,
+        "rank": rank,
+        "world_size": world_size,
+        "labels_shape": list(labels_np.shape),
+        "preds_shape": list(preds_np.shape),
+        "dtype": {"labels": str(labels_np.dtype), "preds": str(preds_np.dtype)},
+        "video_ids": {
+            "type": str(type(video_ids_np)),
+            "len": len(video_ids_np),
+            "unique_cnt": int(len(np.unique(video_ids_np))),
+            "head5": [str(x) for x in video_ids_np[:5]],
+        },
+        "labels_stats": {
+            "min": float(labels_np.min()) if labels_np.size else None,
+            "max": float(labels_np.max()) if labels_np.size else None,
+            "mean": float(labels_np.mean()) if labels_np.size else None,
+            "unique_cnt": int(len(unique_labels)),
+            "unique_head": [float(x) for x in unique_labels[:50]],
+            "non_binary_count": non_binary_count,
+        },
+        "preds_stats": {
+            "min": float(pred_min),
+            "max": float(pred_max),
+            "mean": float(preds_np.mean()),
+            "std": float(preds_np.std()),
+            "nan_cnt": int(np.isnan(preds_np).sum()),
+            "inf_cnt": int(np.isinf(preds_np).sum()),
+            "top1": {
+                "mean": float(top1_scores.mean()),
+                "max": float(top1_scores.max()),
+                "min": float(top1_scores.min()),
+            },
+            "pos_over_0.5": {
+                "mean": float(pos_counts.mean()),
+                "max": float(pos_counts.max()),
+                "min": float(pos_counts.min()),
+            },
+        },
+    }
+    overview.update(extra_dict)
+    logger.info(f"[DebugDump][{split_name}][overview] {json.dumps(overview, ensure_ascii=False)}")
+
+    datasets = ["cholec80", "endoscapes", "cholect50"]
+    for dataset in datasets:
+        mask = np.array([dataset in str(v) for v in video_ids_np])
+        mask_sum = int(mask.sum())
+        coverage = {
+            "dataset": dataset,
+            "count": mask_sum,
+            "ratio": float(mask_sum / max(1, len(video_ids_np))),
+            "unique_video_ids": int(len(np.unique(video_ids_np[mask]))) if mask_sum > 0 else 0,
+        }
+        if mask_sum == 0:
+            coverage["video_id_samples"] = [str(x) for x in video_ids_np[:20]]
+        logger.info(f"[DebugDump][{split_name}][mask] {json.dumps(coverage, ensure_ascii=False)}")
+
+    if sample_indices is None:
+        if len(labels_np) == 0:
+            return
+        sample_indices = [0, len(labels_np) // 2, len(labels_np) - 1]
+    sample_indices = [idx for idx in sample_indices if 0 <= idx < len(labels_np)]
+
+    for idx in sample_indices:
+        lbl = labels_np[idx]
+        pred = preds_np[idx]
+        vid = video_ids_np[idx]
+        label_pos_idx = list(np.where(lbl == 1)[0])
+        topk_idx = list(np.argsort(pred)[::-1][:topk])
+        detail = {
+            "idx": int(idx),
+            "video_id": str(vid),
+            "label_pos_cnt": len(label_pos_idx),
+            "label_pos_indices": label_pos_idx[:30],
+            "pred_topk": [(int(i), float(pred[i])) for i in topk_idx],
+            "pred_scores_at_label1": [(int(i), float(pred[i])) for i in label_pos_idx[:30]],
+        }
+        logger.info(f"[DebugDump][{split_name}][sample] {json.dumps(detail, ensure_ascii=False)}")
+
+    snapshot = {
+        "labels_head": labels_np.astype(np.float32)[:5, :10].tolist(),
+        "preds_head": preds_np.astype(np.float32)[:5, :10].tolist(),
+        "labels_sum_axis0_head": labels_np.sum(axis=0).astype(np.float32)[:10].tolist(),
+        "preds_mean_axis0_head": preds_np.mean(axis=0).astype(np.float32)[:10].tolist(),
+    }
+    logger.info(f"[DebugDump][{split_name}][snapshot] {json.dumps(snapshot, ensure_ascii=False)}")
+
 
 class AverageMeter(object):
 

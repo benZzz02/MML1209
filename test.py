@@ -18,7 +18,7 @@ from torch.optim import lr_scheduler
 
 from loss import SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL
 from mmlsurgadapt import MMLSurgAdaptTrainer
-from utils import AverageMeter, add_weight_decay, mAP
+from utils import AverageMeter, add_weight_decay, mAP, debug_dump_eval
 import warnings
 
 from config import cfg
@@ -46,6 +46,8 @@ def setup_distributed():
 # =============================================================================
 
 def process_cholec80(true,pred,pred_ema,video_ids,test):
+    if pred_ema is None:
+        pred_ema = pred
     true = true[:,:7]
     pred = pred[:,:7]
     pred_ema = pred_ema[:,:7]
@@ -79,6 +81,8 @@ def process_cholec80(true,pred,pred_ema,video_ids,test):
     return f1_score_reg, f1_score_ema, video_f1s, video_f1s_ema
 
 def process_endo(true,pred,pred_ema,video_ids, test):
+    if pred_ema is None:
+        pred_ema = pred
     true = true[:,7:10]
     pred = pred[:,7:10]
     pred_ema = pred_ema[:,7:10]
@@ -111,6 +115,8 @@ def resolve_nan(classwise):
         return classwise
 
 def process_cholect50(true,pred,pred_ema,video_ids,test):
+    if pred_ema is None:
+        pred_ema = pred
     true = true[:,10:]
     pred = pred[:,10:]
     pred_ema = pred_ema[:,10:]
@@ -305,16 +311,27 @@ def save_results(a,b,c,test,dir):
         print(f"Error in saving results : {e}")
 
 
-def calculate_metrics(labels,preds,preds_ema,video_ids,test,dir):
+def calculate_metrics(labels,preds,preds_ema,video_ids,test,dir,method=None):
+    labels = np.asarray(labels)
+    unique_labels = np.unique(labels)
+    assert unique_labels.min() >= 0.0 and unique_labels.max() <= 1.0, \
+        f"Labels out of [0,1] range detected: {unique_labels}"
 
-    labels = np.round(labels)
+    debug_dump_eval(
+        split_name="test" if test else "val",
+        labels=labels,
+        preds=preds,
+        video_ids=video_ids,
+        loader_name="test_loader",
+        extra_dict={"dir": dir, "method": method} if method else {"dir": dir},
+    )
 
     datasets = ["cholec80","endoscapes","cholect50"]
     a, b, c = None, None, None
 
     for dataset in datasets:
         print(f"Processing dataset: {dataset}")
-        mask = np.array([dataset in v for v in video_ids])
+        mask = np.array([dataset in str(v) for v in video_ids])
         
         # 防止mask为空报错
         if not np.any(mask):
@@ -323,7 +340,7 @@ def calculate_metrics(labels,preds,preds_ema,video_ids,test,dir):
 
         filtered_labels  = labels[mask]
         filtered_preds = preds[mask]
-        filtered_preds_ema = preds_ema[mask]
+        filtered_preds_ema = preds_ema[mask] if preds_ema is not None else None
         filtered_video_ids = video_ids[mask]
 
         if dataset == "cholec80":
@@ -368,7 +385,8 @@ def test_phase(trainer, ckpt, dir, criterion, gpu_id) -> None:
     trainer.model.eval()
     criterion = criterion.to('cpu')
 
-    print("Start test...")
+    ckpt_type = "ema" if "ema" in os.path.basename(ckpt).lower() else "regular"
+    print(f"Start test... ckpt_path={ckpt}, ckpt_type={ckpt_type}")
     sigmoid = torch.sigmoid
 
     preds = []
@@ -399,11 +417,18 @@ def test_phase(trainer, ckpt, dir, criterion, gpu_id) -> None:
     # 拼接结果
     all_labels = np.concatenate(targets, axis=0)
     all_predictions_reg = np.concatenate(preds, axis=0)
-    all_predictions_ema = np.zeros_like(all_predictions_reg) # Test 模式下没有 EMA 预测
     all_vids = np.array(all_vids)
     
     # 计算指标
-    calculate_metrics(all_labels, all_predictions_reg, all_predictions_ema, all_vids, True, dir)
+    calculate_metrics(
+        all_labels,
+        all_predictions_reg,
+        None,
+        all_vids,
+        True,
+        dir,
+        method=f"{os.path.basename(ckpt)}|ckpt_type={ckpt_type}",
+    )
 
     mAP_calc = mAP(all_labels, all_predictions_reg)
     loss_calc = sum(losses)/len(losses)

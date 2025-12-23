@@ -29,7 +29,7 @@ from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
     iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency
 )
-from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure, TopKCheckpointManager
+from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure, TopKCheckpointManager, debug_dump_eval
 from config import cfg
 from consistency import ConsistencyAugmentor
 
@@ -83,6 +83,8 @@ def hill_elementwise_loss(logits, targets, hill_obj):
 # 指标计算函数
 # =============================================================================
 def process_cholec80(true, pred, pred_ema, video_ids, test):
+    if pred_ema is None:
+        pred_ema = pred
     true = true[:, :7]
     pred = pred[:, :7]
     pred_ema = pred_ema[:, :7]
@@ -116,6 +118,8 @@ def process_cholec80(true, pred, pred_ema, video_ids, test):
     return f1_score_reg, f1_score_ema, video_f1s, video_f1s_ema
 
 def process_endo(true, pred, pred_ema, video_ids, test):
+    if pred_ema is None:
+        pred_ema = pred
     true = true[:, 7:10]
     pred = pred[:, 7:10]
     pred_ema = pred_ema[:, 7:10]
@@ -144,6 +148,8 @@ def resolve_nan(classwise):
     return classwise
 
 def process_cholect50(true, pred, pred_ema, video_ids, test):
+    if pred_ema is None:
+        pred_ema = pred
     true = true[:, 10:]
     pred = pred[:, 10:]
     pred_ema = pred_ema[:, 10:]
@@ -271,19 +277,33 @@ def save_results(a, b, c, test, dir, method):
 def calculate_metrics(labels, preds, preds_ema, video_ids, test, dir, method=None):
     if not is_main_process(): return None, None, None
 
-    labels = np.round(labels)
+    labels = np.asarray(labels)
+    unique_labels = np.unique(labels)
+    assert unique_labels.min() >= 0.0 and unique_labels.max() <= 1.0, \
+        f"Labels out of [0,1] range detected: {unique_labels}"
+    logger.info(f"[Metrics][{ 'test' if test else 'val' }] label uniques: {unique_labels}")
+
+    debug_dump_eval(
+        split_name="test" if test else "val",
+        labels=labels,
+        preds=preds,
+        video_ids=video_ids,
+        loader_name="test_loader" if test else "clean_val_loader",
+        extra_dict={"method": method} if method else {},
+    )
+
     datasets = ["cholec80", "endoscapes", "cholect50"]
     a, b, c = None, None, None
 
     for dataset in datasets:
-        mask = np.array([dataset in v for v in video_ids])
+        mask = np.array([dataset in str(v) for v in video_ids])
 
         if not np.any(mask):
             continue
 
         filtered_labels = labels[mask]
         filtered_preds = preds[mask]
-        filtered_preds_ema = preds_ema[mask]
+        filtered_preds_ema = preds_ema[mask] if preds_ema is not None else None
         filtered_video_ids = video_ids[mask]
 
         if dataset == "cholec80":
@@ -677,7 +697,7 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
     model_to_run = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
     ema_to_run = trainer.ema.module if hasattr(trainer.ema, 'module') else trainer.ema
 
-    for _, (input, target, vid) in enumerate(trainer.val_loader):
+    for _, (input, target, vid) in enumerate(trainer.clean_val_loader):
         target = target.cuda(non_blocking=True)
         input = input.cuda(non_blocking=True)
         with torch.no_grad():
@@ -713,7 +733,15 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
     all_predictions_ema = np.concatenate(preds_ema, axis=0)
     all_vids = np.array(all_vids)
 
-    calculate_metrics(all_labels, all_predictions_reg, all_predictions_ema, all_vids, False, dir)
+    calculate_metrics(
+        all_labels,
+        all_predictions_reg,
+        all_predictions_ema,
+        all_vids,
+        False,
+        dir,
+        method=f"epoch_{epoch}_val",
+    )
 
     mAP_score_regular = mAP(all_labels, all_predictions_reg)
     mAP_score_ema = mAP(all_labels, all_predictions_ema)
@@ -821,6 +849,42 @@ def save_best_init(trainer, if_ema_better, dir):
         torch.save(ema_state_dict, os.path.join(save_path, 'model-highest.ckpt'))
     else:
         torch.save(state_dict, os.path.join(save_path, 'model-highest.ckpt'))
+
+def run_single_eval(trainer, loader, split_name: str, dir: str, method: str, is_test: bool):
+    if not is_main_process():
+        return
+    trainer.model.eval()
+    sigmoid = torch.sigmoid
+    preds, targets, all_vids = [], [], []
+    model_to_run = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
+
+    for _, (input, target, vid) in enumerate(loader):
+        target = target.cuda(non_blocking=True)
+        input = input.cuda(non_blocking=True)
+        with torch.no_grad():
+            out = model_to_run(input)
+            if isinstance(out, tuple):
+                output_logits = out[0]
+            else:
+                output_logits = out
+            output = sigmoid(output_logits)
+        preds.append(output.cpu().numpy())
+        targets.append(target.cpu().numpy())
+        all_vids.extend(vid)
+
+    all_labels = np.concatenate(targets, axis=0)
+    all_predictions = np.concatenate(preds, axis=0)
+    all_vids_np = np.array(all_vids)
+    calculate_metrics(
+        all_labels,
+        all_predictions,
+        None,
+        all_vids_np,
+        is_test,
+        dir,
+        method=f"{method}|split={split_name}",
+    )
+    logger.info(f"[DebugEval][{split_name}] mAP: {mAP(all_labels, all_predictions):.2f}")
 
 def train(trainer, dir) -> list:
     loss_dict = {
@@ -1063,6 +1127,9 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
         model_to_run.load_state_dict(state_dict, strict=True)
         model_to_run.eval()
 
+        ckpt_type = "ema" if "ema" in filename.lower() else "regular"
+        logger.info(f"[Test] ckpt_path={ckpt_path}, ckpt_type={ckpt_type}")
+
         preds, targets, all_vids = [], [], []
         for i, (input, target, vid) in enumerate(trainer.test_loader):
             target = target.cuda(non_blocking=True)
@@ -1073,6 +1140,7 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
                 if isinstance(out, tuple): output_logits = out[0]
                 else: output_logits = out
                 output = sigmoid(output_logits)
+
             preds.append(output.cpu().numpy())
             targets.append(target.cpu().numpy())
             all_vids.extend(vid)
@@ -1081,7 +1149,16 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
         all_predictions = np.concatenate(preds, axis=0)
         all_vids_np = np.array(all_vids)
         method_name = filename.replace('.ckpt', '')
-        calculate_metrics(all_labels, all_predictions, all_predictions, all_vids_np, True, dir, method=method_name)
+        calculate_metrics(
+            all_labels,
+            all_predictions,
+            None,
+            all_vids_np,
+            True,
+            dir,
+            method=f"{method_name}|ckpt_type={ckpt_type}|path={ckpt_path}",
+        )
+        logger.info(f"[Test][{method_name}] mAP: {mAP(all_labels, all_predictions):.2f}")
         processed_epochs.add(epoch_id)
         logger.info(f"Finished testing {method_name}")
 
@@ -1122,7 +1199,22 @@ def main():
     
     if is_main_process():
         logger.info('Init: ' + ('On' if cfg.perform_init else 'Off'))
-        
+
+    if args.debug_eval_ckpt:
+        ckpt_path = args.debug_eval_ckpt
+        logger.info(f"[DebugEval] Running debug eval for ckpt: {ckpt_path}")
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id}
+        state_dict = torch.load(ckpt_path, map_location=map_location)
+        model_to_run = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
+        model_to_run.load_state_dict(state_dict, strict=True)
+        trainer.model.eval()
+        run_single_eval(trainer, trainer.clean_val_loader, "val", dir, os.path.basename(ckpt_path), is_test=False)
+        run_single_eval(trainer, trainer.test_loader, "test", dir, os.path.basename(ckpt_path), is_test=True)
+        if is_distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
+
     if cfg.test:
         if args.weights:
             target_models = [args.weights]
