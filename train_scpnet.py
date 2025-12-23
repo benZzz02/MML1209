@@ -271,7 +271,12 @@ def save_results(a, b, c, test, dir, method):
 def calculate_metrics(labels, preds, preds_ema, video_ids, test, dir, method=None):
     if not is_main_process(): return None, None, None
 
-    labels = np.round(labels)
+    labels = np.asarray(labels)
+    unique_labels = np.unique(labels)
+    assert unique_labels.min() >= 0.0 and unique_labels.max() <= 1.0, \
+        f"Labels out of [0,1] range detected: {unique_labels}"
+    logger.info(f"[Metrics][{ 'test' if test else 'val' }] label uniques: {unique_labels}")
+
     datasets = ["cholec80", "endoscapes", "cholect50"]
     a, b, c = None, None, None
 
@@ -677,7 +682,7 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
     model_to_run = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
     ema_to_run = trainer.ema.module if hasattr(trainer.ema, 'module') else trainer.ema
 
-    for _, (input, target, vid) in enumerate(trainer.val_loader):
+    for _, (input, target, vid) in enumerate(trainer.clean_val_loader):
         target = target.cuda(non_blocking=True)
         input = input.cuda(non_blocking=True)
         with torch.no_grad():
@@ -1063,7 +1068,13 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
         model_to_run.load_state_dict(state_dict, strict=True)
         model_to_run.eval()
 
+        # 将同一 checkpoint 同步到 regular/EMA 两条推理路径，保持测试与验证的评估口径一致
+        ema_to_run = trainer.ema.module if hasattr(trainer.ema, 'module') else trainer.ema
+        ema_to_run.load_state_dict(state_dict, strict=True)
+        ema_to_run.eval()
+
         preds, targets, all_vids = [], [], []
+        preds_ema = []
         for i, (input, target, vid) in enumerate(trainer.test_loader):
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
@@ -1073,15 +1084,23 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
                 if isinstance(out, tuple): output_logits = out[0]
                 else: output_logits = out
                 output = sigmoid(output_logits)
+
+                out_ema = ema_to_run(input)
+                if isinstance(out_ema, tuple): output_ema_logits = out_ema[0]
+                else: output_ema_logits = out_ema
+                output_ema = sigmoid(output_ema_logits)
             preds.append(output.cpu().numpy())
+            preds_ema.append(output_ema.cpu().numpy())
             targets.append(target.cpu().numpy())
             all_vids.extend(vid)
 
         all_labels = np.concatenate(targets, axis=0)
         all_predictions = np.concatenate(preds, axis=0)
+        all_predictions_ema = np.concatenate(preds_ema, axis=0)
         all_vids_np = np.array(all_vids)
         method_name = filename.replace('.ckpt', '')
-        calculate_metrics(all_labels, all_predictions, all_predictions, all_vids_np, True, dir, method=method_name)
+        calculate_metrics(all_labels, all_predictions, all_predictions_ema, all_vids_np, True, dir, method=method_name)
+        logger.info(f"[Test][{method_name}] mAP regular: {mAP(all_labels, all_predictions):.2f}, mAP EMA: {mAP(all_labels, all_predictions_ema):.2f}")
         processed_epochs.add(epoch_id)
         logger.info(f"Finished testing {method_name}")
 
