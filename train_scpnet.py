@@ -27,7 +27,7 @@ from args import args
 from log import logger
 from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
-    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency
+    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency,Hill_Ignore
 )
 from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure, TopKCheckpointManager
 from config import cfg
@@ -35,10 +35,8 @@ from consistency import ConsistencyAugmentor
 
 from model import (
     load_clip_model, MMLSurgAdapt, Resnet, ViT, CrossModel, CLIP_for_train, VLPL, HSPNet,
-    MMLSurgAdaptCoOp, MMLSurgAdaptDualCoOp, MMLSurgAdaptCoCoOp,
-    MMLSurgAdaptCoOpFrozen, MMLSurgAdaptDualCoOpFrozen, MMLSurgAdaptCoCoOpFrozen, 
-    CLIP_TextAttention, CLIP_TextAttentionCoOp, CLIPCoOpLoRA,
-    MMLSurgAdaptSCPNet, MMLSurgAdaptSCPNet_Plus 
+    
+    MMLSurgAdaptSCPNet
 )
 from surgvlp import SurgAVLP, CBertViT
 
@@ -427,68 +425,87 @@ class SCPNetTrainer():
     
     # [核心修复] train 函数中的 Loss 调用逻辑
     def train(self, input, target, criterion, epoch, epoch_i) -> torch.Tensor:
+        debug = getattr(cfg, "debug", False)
+        debug_step = getattr(cfg, "debug_step", 200)
+
         image = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
-        
-        need_consistency = (
-            self.use_consistency and
-            self.model.training and
-            self.augmentor is not None
-        )
-        
-        image_strong = None
-        if need_consistency:
-            image_strong = self.augmentor.augment_batch(image.cpu()).cuda(non_blocking=True)
 
+        # 特殊损失：需要 image encoder 特征（例如 BBAM 等）
         if getattr(criterion, 'needs_features', False):
-            # BBAM etc
             with autocast():
                 features = self.model_unwrap.image_encoder(image.type(self.model_unwrap.dtype))
                 features = torch.nn.functional.normalize(features, p=2, dim=-1)
             loss, _ = criterion(features, target, epoch)
-            
-        else:
-            with autocast():
-                # [适配] SCPNet 系列：支持 (image, strong) 输入和多返回值
-                if cfg.model in ['SCPNet', 'SCPNet_Plus', 'MMLSurgAdaptSCPNet_Plus']:
-                    output_tuple = self.model(image, image_strong)
-                    
-                    if isinstance(output_tuple, tuple):
-                        logits, A_star, loss_cons_internal = output_tuple
-                    else:
-                        logits, A_star, loss_cons_internal = output_tuple, None, 0.0
-                    
-                    # [修复 TypeError] 
-                    # 尝试传递 A_star，如果 Loss 不支持（如标准 Hill），则回退到普通调用
-                    try:
-                        loss_main, _ = criterion(logits, target, epoch, A_star=A_star)
-                    except TypeError:
-                        loss_main, _ = criterion(logits, target, epoch)
-                    
-                    w_cons = getattr(cfg, 'w_cons', 1.0)
-                    loss = loss_main + w_cons * loss_cons_internal
+            return loss
 
-                # [适配] 旧模型逻辑
-                else:
-                    if need_consistency:
-                        combined = torch.cat([image, image_strong], dim=0)
-                        combined_output = self.model(combined).float()
-                        
-                        batch_size = image.shape[0]
-                        output_clean = combined_output[:batch_size]
-                        output_aug = combined_output[batch_size:]
-                        
-                        if hasattr(criterion, 'cons_weight'):
-                            loss, _ = criterion(output_clean, output_aug, target, epoch)
-                        else:
-                            loss, _ = criterion(output_clean, target, epoch)
+        # 常规：直接 forward(image) + loss
+        with autocast():
+            # SCPNet：可能返回 (logits, ignore_neg_mask) 或 logits
+            if cfg.model in ['SCPNet', 'SCPNet_Plus', 'MMLSurgAdaptSCPNet_Plus']:
+                out = self.model(image)
+
+                ignore_neg_mask = None
+                if isinstance(out, tuple):
+                    if len(out) >= 2:
+                        logits, ignore_neg_mask = out[0], out[1]
                     else:
-                        output = self.model(image).float()
-                        if hasattr(criterion, 'cons_weight'):
-                            loss, _ = criterion(output, None, target, epoch)
-                        else:
-                            loss, _ = criterion(output, target, epoch)
-            
+                        logits = out[0]
+                else:
+                    logits = out
+
+                # Hill_Ignore 等：如果支持 ignore_neg_mask 就传
+                try:
+                    loss, _ = criterion(logits, target, epoch, ignore_neg_mask=ignore_neg_mask)
+                except TypeError:
+                    loss, _ = criterion(logits, target, epoch)
+
+            # 其它模型：兼容 tuple 返回
+            else:
+                out = self.model(image).float()
+                if isinstance(out, tuple):
+                    out = out[0]
+                loss, _ = criterion(out, target, epoch)
+
+        if debug and is_main_process() and epoch_i % debug_step == 0:
+            with torch.no_grad():
+                probs = torch.sigmoid(logits)
+
+                # 正样本数（GT）
+                pos_cnt = target.sum(dim=1).float().mean().item()
+
+                # 预测 top1 置信度
+                top1_prob = probs.max(dim=1)[0].mean().item()
+
+                # ignore 掩码情况（若存在）
+                if ignore_neg_mask is not None:
+                    ignore_cnt = ignore_neg_mask.sum(dim=1).float().mean().item()
+                else:
+                    ignore_cnt = 0.0
+
+                logger.info(
+                    f"[DEBUG][E{epoch}][I{epoch_i}] "
+                    f"loss={loss.item():.4f} | "
+                    f"pos/gt={pos_cnt:.2f} | "
+                    f"top1_prob={top1_prob:.3f} | "
+                    f"ignore/cls={ignore_cnt:.2f}"
+                )
+        if debug and is_main_process() and epoch_i % debug_step == 0:
+            with torch.no_grad():
+                pred_idx = logits.argmax(dim=-1)
+                b0 = 0  # 只看 batch 第一个样本
+
+                logger.info(
+                    f"[DEBUG][SCP] "
+                    f"pred_idx={pred_idx[b0].item()} | "
+                    f"pred_logit={logits[b0, pred_idx[b0]].item():.3f}"
+                )
+
+                if ignore_neg_mask is not None:
+                    ignored = torch.where(ignore_neg_mask[b0])[0].tolist()
+                    logger.info(f"[DEBUG][SCP] ignored_labels(sample0)={ignored}")
+
+
         return loss
 
 # =============================================================================
@@ -518,6 +535,7 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
         'SPLC_Consistency': lambda: SPLC_Consistency(
             tau=getattr(cfg, 'tau', 0.6), change_epoch=getattr(cfg, 'change_epoch', 1), margin=getattr(cfg, 'margin', 1.0), gamma=getattr(cfg, 'gamma', 2.0), cons_weight=getattr(cfg, 'cons_weight', 20.0), cons_temp=getattr(cfg, 'cons_temp', 1.0)
         ),
+        'Hill_Ignore': Hill_Ignore
     }
     if criterion is None:
         criterion = loss_dict.get(cfg.loss, lambda: None)()
@@ -688,6 +706,7 @@ def train(trainer, dir) -> list:
         'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
         'Hill_Consistency': lambda: Hill_Consistency(lamb=getattr(cfg, 'lamb', 1.5), margin=getattr(cfg, 'margin', 1.0), gamma=getattr(cfg, 'gamma', 2.0), cons_weight=getattr(cfg, 'cons_weight', 20.0), cons_temp=getattr(cfg, 'cons_temp', 1.0)),
         'SPLC_Consistency': lambda: SPLC_Consistency(tau=getattr(cfg, 'tau', 0.6), change_epoch=getattr(cfg, 'change_epoch', 1), margin=getattr(cfg, 'margin', 1.0), gamma=getattr(cfg, 'gamma', 2.0), cons_weight=getattr(cfg, 'cons_weight', 20.0), cons_temp=getattr(cfg, 'cons_temp', 1.0)),
+        'Hill_Ignore': Hill_Ignore
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
     if criterion is None: raise ValueError(f"Loss function '{cfg.loss}' not found.")

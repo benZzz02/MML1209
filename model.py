@@ -1,83 +1,97 @@
+# model.py
 from collections import OrderedDict
 import os
+import math
+import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torchvision import models
-import torchvision.transforms as T
+
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from config import cfg
 from log import logger
-from peft import LoraConfig, get_peft_model, TaskType 
-import numpy as np
+
+from peft import LoraConfig, get_peft_model, TaskType
+
 _tokenizer = _Tokenizer()
 
+
+# ------------------------------
+# Helpers
+# ------------------------------
+def _cfg(name: str, default):
+    return getattr(cfg, name, default)
+
+
+# ------------------------------
+# LoRA injection
+# ------------------------------
 def add_lora_to_clip(clip_model: nn.Module):
     """
     根据 cfg 配置动态创建 LoRA 适配器，并注入到 CLIP 编码器。
-    
     返回：LoRA 包装后的 clip_model 模块。
     """
-    
-    # 检查是否启用 LoRA，如果未启用则跳过注入，但仍然冻结基座参数
-    if not hasattr(cfg, 'LORA') or not cfg.LORA.ENABLED:
-        logger.info("LoRA is disabled or LORA config not found. Freezing CLIP encoders for default Prompt Tuning.")
-        # 如果 LoRA 关闭，则进行原始的 Prompt Tuning 冻结行为
+    if not hasattr(cfg, "LORA") or not cfg.LORA.ENABLED:
+        logger.info(
+            "LoRA is disabled or LORA config not found. Freezing CLIP encoders for default Prompt Tuning."
+        )
         for param in clip_model.parameters():
             param.requires_grad_(False)
         return clip_model
 
     logger.info(f"LoRA enabled. Injecting LoRA adapters with r={cfg.LORA.R}, alpha={cfg.LORA.ALPHA}.")
 
-    # 1. 冻结所有 CLIP 基座参数
+    # 1) freeze base
     for param in clip_model.parameters():
         param.requires_grad_(False)
-        
-    # 2. 创建 LoRA 配置 (从 cfg 中读取参数)
+
+    # 2) lora config
     lora_config = LoraConfig(
         r=cfg.LORA.R,
         lora_alpha=cfg.LORA.ALPHA,
-        target_modules=cfg.LORA.TARGET_MODULES, 
+        target_modules=cfg.LORA.TARGET_MODULES,
         lora_dropout=cfg.LORA.DROPOUT,
         bias="none",
         task_type=TaskType.FEATURE_EXTRACTION,
     )
-        
-    # 3. 对 Visual Encoder (clip_model.visual) 应用 LoRA
+
+    # 3) inject
     clip_model.visual = get_peft_model(clip_model.visual, lora_config)
-    
-    # 4. 对 Text Transformer (clip_model.transformer) 应用 LoRA
     clip_model.transformer = get_peft_model(clip_model.transformer, lora_config)
-    
-    # LoRA 适配器参数会自动设置为 requires_grad=True
+
     return clip_model
 
-# --- model.py (Modifying MMLSurgAdaptCoOp) ---
-# 您无需修改 TextEncoder 的 forward，因为 LoRA 是在 self.transformer 内部注入的。
+
 def load_clip_to_cpu():
     backbone_name = cfg.backbone
-    if cfg.backbone == 'SurgVLP':
-        backbone_name = 'RN50'
+    if cfg.backbone == "SurgVLP":
+        backbone_name = "RN50"
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
 
     try:
-        # loading JIT archive
-        model = torch.jit.load(  # type: ignore
-            model_path, map_location="cpu").eval()
+        model = torch.jit.load(model_path, map_location="cpu").eval()  # type: ignore
         state_dict = None
-
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
 
     model = clip.build_model(state_dict or model.state_dict())  # type: ignore
-
     return model
 
 
-class TextEncoder(nn.Module):
+def load_clip_model():
+    clip_model = load_clip_to_cpu()
+    clip_model.float()
+    return clip_model, clip._transform(clip_model.visual.input_resolution)
 
+
+# ------------------------------
+# Text Encoder
+# ------------------------------
+class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
         self.transformer = clip_model.transformer
@@ -89,27 +103,25 @@ class TextEncoder(nn.Module):
     def forward(self, prompts, tokenized_prompts, retrun_adapater_func=None):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        if retrun_adapater_func == None:
+        if retrun_adapater_func is None:
             x = self.transformer(x)
         else:
             x = self.transformer([x, retrun_adapater_func])
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]),
-              tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
+
+
 class LoRATextEncoder(nn.Module):
     """
     TextEncoder adapted for PeftModel (LoRA) injection.
     它显式访问基座 Transformer 模块，以避免 Peft 注入 'input_ids' 关键字参数导致的 TypeError。
     """
+
     def __init__(self, clip_model):
         super().__init__()
-        # 属性继承与原 TextEncoder 相同
         self.transformer = clip_model.transformer
         self.positional_embedding = clip_model.positional_embedding
         self.ln_final = clip_model.ln_final
@@ -118,36 +130,30 @@ class LoRATextEncoder(nn.Module):
 
     def forward(self, prompts, tokenized_prompts, retrun_adapater_func=None):
         x = prompts + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = x.permute(1, 0, 2)
 
-        # FIX: 显式获取 PeftModel 内部的基座 Transformer 模块
-        # 确保调用时只传入位置参数 x
-        transformer_module = self.transformer.base_model if hasattr(self.transformer, 'base_model') else self.transformer
-
-        if retrun_adapater_func == None:
-            x = transformer_module(x) 
+        transformer_module = self.transformer.base_model if hasattr(self.transformer, "base_model") else self.transformer
+        if retrun_adapater_func is None:
+            x = transformer_module(x)
         else:
-            # 兼容原有的 adapter_func 逻辑
             x = self.transformer([x, retrun_adapater_func])
-            
-        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        x = x.permute(1, 0, 2)
         x = self.ln_final(x).type(self.dtype)
-
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        x = x[torch.arange(x.shape[0]),
-              tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
-class ParentPromptLearner(nn.Module):
 
+
+# ------------------------------
+# Prompt Learners
+# ------------------------------
+class ParentPromptLearner(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-
-        assert(classnames is None)
-        with open(cfg.super_labels, 'r') as f:
+        assert classnames is None
+        with open(cfg.super_labels, "r") as f:
             text = f.readlines()
-        classnames = [ t.strip() for t in text]
-
+        classnames = [t.strip() for t in text]
         logger.info(f"Super classnames: {classnames}")
 
         n_cls = len(classnames)
@@ -156,16 +162,16 @@ class ParentPromptLearner(nn.Module):
 
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = 224
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        assert cfg_imsize == clip_imsize
 
-        # use given words to initialize context vectors
         logger.info(f"Use {cfg.parent_ctx_init} initialize parent prompt")
         ctx_init = cfg.parent_ctx_init.replace("_", " ")
-        assert (n_ctx == len(ctx_init.split(" ")))
+        assert n_ctx == len(ctx_init.split(" "))
+
         prompt = clip.tokenize(ctx_init)
         with torch.no_grad():
             embedding = clip_model.token_embedding(prompt).type(dtype)
-        ctx_vectors = embedding[0, 1:1 + n_ctx, :]
+        ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
         prompt_prefix = ctx_init
 
         logger.info(f'Initial context: "{prompt_prefix}"')
@@ -178,55 +184,52 @@ class ParentPromptLearner(nn.Module):
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        #print(f"Prompt shape : {tokenized_prompts.shape}")
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(
-                dtype)
-        #print(f"Embedding shape : {embedding.shape}")
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        # These token vectors will be saved when in save_model(),
-        # but they should be ignored in load_model() as we want to use
-        # those computed using the current class names
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix",
-                             embedding[:, 1 + n_ctx:, :])  # CLS, EOS
-        self.register_buffer("token_middle", embedding[:, 1:(1 + n_ctx), :])
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+        self.register_buffer("token_middle", embedding[:, 1 : (1 + n_ctx), :])
+
         self.n_cls = n_cls
         self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.tokenized_prompts = tokenized_prompts
         self.name_lens = name_lens
 
-        assert (embedding.requires_grad == False)
-        assert (cfg.parent_ctx_init != "random")
+        assert embedding.requires_grad is False
+        assert cfg.parent_ctx_init != "random"
         self.register_buffer("embedding", embedding)
 
     def forward(self):
         return self.embedding
 
-class ChildPromptLearner(nn.Module):
 
+class ChildPromptLearner(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        classnames = classnames[0:cfg.child_num]
+        classnames = classnames[0 : cfg.child_num]
         n_cls = len(classnames)
         n_ctx = cfg.child_n_ctx
         dtype = clip_model.dtype
+
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = 224
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        assert cfg_imsize == clip_imsize
 
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        #print(f"Ctx_dim : {ctx_dim}")
         self.ctx_dim = ctx_dim
 
         prompt_prefix = " ".join(["X"] * n_ctx)
-        self.meta_net = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(1024, ctx_dim * n_ctx)),
-            ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(ctx_dim * n_ctx, ctx_dim * n_ctx))
-        ]))
-    
-        # use given words to initialize context vectors
+        self.meta_net = nn.Sequential(
+            OrderedDict(
+                [
+                    ("linear1", nn.Linear(1024, ctx_dim * n_ctx)),
+                    ("relu", nn.ReLU(inplace=True)),
+                    ("linear2", nn.Linear(ctx_dim * n_ctx, ctx_dim * n_ctx)),
+                ]
+            )
+        )
+
         logger.info(f"Number of child context words (tokens): {n_ctx}")
 
         classnames = [name.replace("_", " ") for name in classnames]
@@ -235,66 +238,47 @@ class ChildPromptLearner(nn.Module):
 
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(
-                dtype)
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        # These token vectors will be saved when in save_model(),
-        # but they should be ignored in load_model() as we want to use
-        # those computed using the current class names
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix",
-                             embedding[:, 1 + n_ctx:, :])  # CLS, EOS
-        
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+
         self.n_cls = n_cls
         self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.tokenized_prompts = tokenized_prompts
         self.name_lens = name_lens
 
         self.parent_index = np.load(cfg.super_labels_index)
         self.parent_index = torch.Tensor(self.parent_index).type(torch.long)
         logger.info(f"{self.parent_index}")
-        assert(self.parent_index.requires_grad == False)
+        assert self.parent_index.requires_grad is False
 
     def forward(self, parent):
         prefix = self.token_prefix
         suffix = self.token_suffix
-        #print(f"Parent shape before meta net: {parent.shape}")
+
         parent = self.meta_net(parent)
-        #print(f"Parent shape after meta net: {parent.shape}")
         parent = parent[self.parent_index]
         parent = parent.reshape(-1, self.n_ctx, self.ctx_dim)
-        #print(f"Parent shape after reshaping: {parent.shape}")
-        #print(f"Prefix shape: {prefix.shape}")
-        #print(f"Suffix shape: {suffix.shape}")
-        prompts = torch.cat(
-            [
-                prefix,
-                parent,
-                suffix
-            ],
-            dim = 1
-        )
-        return prompts
-    
-class PromptLearner(nn.Module):
 
+        prompts = torch.cat([prefix, parent, suffix], dim=1)
+        return prompts
+
+
+class PromptLearner(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        classnames = classnames[0:cfg.child_num]
+        classnames = classnames[0 : cfg.child_num]
         n_cls = len(classnames)
         n_ctx = cfg.child_n_ctx
         dtype = clip_model.dtype
+
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = 224
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
-
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        #print(f"Ctx_dim : {ctx_dim}")
-        self.ctx_dim = ctx_dim
+        assert cfg_imsize == clip_imsize
 
         prompt_prefix = "a photo "
-    
-        # use given words to initialize context vectors
+
         logger.info(f"Number of child context words (tokens): {n_ctx}")
 
         classnames = [name.replace("_", " ") for name in classnames]
@@ -303,53 +287,38 @@ class PromptLearner(nn.Module):
 
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(
-                dtype)
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        # These token vectors will be saved when in save_model(),
-        # but they should be ignored in load_model() as we want to use
-        # those computed using the current class names
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix",
-                             embedding[:, 1 + n_ctx:, :])  # CLS, EOS
-        
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+
         self.n_cls = n_cls
         self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.tokenized_prompts = tokenized_prompts
         self.name_lens = name_lens
-        assert (embedding.requires_grad == False)
+
+        assert embedding.requires_grad is False
         self.register_buffer("embedding", embedding)
 
     def forward(self):
         return self.embedding
 
-def load_clip_model():
-    clip_model = load_clip_to_cpu()
 
-    # CLIP's default precision is fp16
-    clip_model.float()
-    return clip_model, clip._transform(clip_model.visual.input_resolution)
-
-import math
-import numpy as np
+# ------------------------------
+# GCN basics
+# ------------------------------
 class GraphConvolution(nn.Module):
-    """
-    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
-    """
-
     def __init__(self, in_features, out_features, bias=False):
-        super(GraphConvolution, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        super().__init__()
         self.weight = nn.Parameter(torch.Tensor(in_features, out_features))
         if bias:
             self.bias = nn.Parameter(torch.Tensor(1, 1, out_features))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
         self.reset_parameters()
 
     def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight.size(1))
+        stdv = 1.0 / math.sqrt(self.weight.size(1))
         self.weight.data.uniform_(-stdv, stdv)
         if self.bias is not None:
             self.bias.data.uniform_(-stdv, stdv)
@@ -357,77 +326,63 @@ class GraphConvolution(nn.Module):
     def forward(self, input, adj):
         support = torch.matmul(input, self.weight)
         output = torch.matmul(adj, support)
-        if self.bias is not None:
-            return output + self.bias
-        else:
-            return output
+        return output + self.bias if self.bias is not None else output
 
-    def __repr__(self):
-        return self.__class__.__name__ + ' (' \
-               + str(self.in_features) + ' -> ' \
-               + str(self.out_features) + ')'
 
 class GCN(nn.Module):
     def __init__(self):
-        super(GCN, self).__init__()
-        if cfg.backbone == 'RN50':
+        super().__init__()
+        if cfg.backbone == "RN50":
             self.gc1 = GraphConvolution(1024, 2048)
             self.gc2 = GraphConvolution(2048, 2048)
             self.gc3 = GraphConvolution(2048, 1024)
-        elif cfg.backbone == 'ViT-B/16':
+        elif cfg.backbone == "ViT-B/16":
             self.gc1 = GraphConvolution(512, 1024)
             self.gc2 = GraphConvolution(1024, 1024)
             self.gc3 = GraphConvolution(1024, 512)
-        elif cfg.backbone == 'ViT-L/14':
+        elif cfg.backbone == "ViT-L/14":
             self.gc1 = GraphConvolution(768, 1536)
             self.gc2 = GraphConvolution(1536, 1536)
             self.gc3 = GraphConvolution(1536, 768)
-        elif cfg.backbone == 'SurgVLP':
+        elif cfg.backbone == "SurgVLP":
             self.gc1 = GraphConvolution(768, 1536)
             self.gc2 = GraphConvolution(1536, 1536)
             self.gc3 = GraphConvolution(1536, 768)
         else:
             raise NameError
+
         self.relu = nn.LeakyReLU(0.2)
         self.relu2 = nn.LeakyReLU(0.2)
         self.gamma = torch.nn.Parameter(torch.ones(1) * 0.9, requires_grad=True)
-    
+
     def forward(self, features, relation):
         identity = features
-        assert(relation.requires_grad == False)
-        text_features = features
-        text_features = self.gc1(text_features, relation.cuda())
-        text_features = self.relu(text_features)
-        text_features = self.gc2(text_features, relation.cuda())
-        text_features = self.relu2(text_features)
-        text_features = self.gc3(text_features, relation.cuda())
-        text_features = self.gamma * text_features + (1-self.gamma) * identity
-        return text_features
-    
+        assert relation.requires_grad is False
+        x = self.gc1(features, relation.cuda())
+        x = self.relu(x)
+        x = self.gc2(x, relation.cuda())
+        x = self.relu2(x)
+        x = self.gc3(x, relation.cuda())
+        x = self.gamma * x + (1 - self.gamma) * identity
+        return x
+
+
+# ------------------------------
+# Cross-model attention blocks
+# ------------------------------
 class MultiHeadAttention(nn.Module):
     def __init__(self, emb_dim, heads, dropout_rate=0.1):
-        super(MultiHeadAttention, self).__init__()
-
+        super().__init__()
         self.emb_dim = emb_dim
         self.heads = heads
         self.head_dim = emb_dim // heads
-
-        assert (
-            self.head_dim * heads == emb_dim
-        ), "Embedding size needs to be divisible by heads"
+        assert self.head_dim * heads == emb_dim
 
         self.values = nn.Linear(emb_dim, emb_dim, bias=False)
         self.keys = nn.Linear(emb_dim, emb_dim, bias=False)
         self.queries = nn.Linear(emb_dim, emb_dim, bias=False)
         self.fc_out = nn.Linear(emb_dim, emb_dim)
-
         self.dropout = nn.Dropout(dropout_rate)
-
-        # nn.init.xavier_uniform_(self.queries.weight)
-        # nn.init.xavier_uniform_(self.keys.weight)
-        # nn.init.xavier_uniform_(self.values.weight)
-        # nn.init.xavier_uniform_(self.fc_out.weight)
-        # nn.init.zeros_(self.fc_out.bias)
 
     def forward(self, values, keys, queries):
         bs, _, _ = queries.shape
@@ -437,84 +392,58 @@ class MultiHeadAttention(nn.Module):
         queries = self.queries(queries).reshape(bs, -1, self.heads, self.head_dim)
 
         energy = torch.einsum("bqhd,bkhd->bhqk", [queries, keys])
-
         attention = F.softmax(energy / (self.emb_dim ** (1 / 2)), dim=3)
         attention = self.dropout(attention)
 
-        out = torch.einsum("bhql,blhd->bqhd", [attention, values]).reshape(
-            bs, -1, self.heads * self.head_dim
-        )
-
+        out = torch.einsum("bhql,blhd->bqhd", [attention, values]).reshape(bs, -1, self.heads * self.head_dim)
         out = self.fc_out(out)
         return out
-    
+
+
 class TextToImageAttentionLayer(nn.Module):
     def __init__(self, emb_dim, dropout_rate=0.1):
-        super(TextToImageAttentionLayer, self).__init__()
-
-        self.cross_attention = MultiHeadAttention(
-            emb_dim, heads=4, dropout_rate=dropout_rate
-        )
-        self.self_attention = MultiHeadAttention(
-            emb_dim, heads=4, dropout_rate=dropout_rate
-        )
-
+        super().__init__()
+        self.cross_attention = MultiHeadAttention(emb_dim, heads=4, dropout_rate=dropout_rate)
+        self.self_attention = MultiHeadAttention(emb_dim, heads=4, dropout_rate=dropout_rate)
         self.layer_norm1 = nn.LayerNorm(emb_dim)
         self.layer_norm2 = nn.LayerNorm(emb_dim)
-
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, text, image):
-
         attended_image = self.cross_attention(text, text, image)
         attended_image = self.dropout(attended_image)
-        attended_image = self.layer_norm1(attended_image + image)  # Residual connection
+        attended_image = self.layer_norm1(attended_image + image)
 
-        self_attended_image = self.self_attention(
-            attended_image, attended_image, attended_image
-        )
+        self_attended_image = self.self_attention(attended_image, attended_image, attended_image)
         self_attended_image = self.dropout(self_attended_image)
-        self_attended_image = self.layer_norm2(
-            self_attended_image + attended_image
-        )  # Residual connection
-
+        self_attended_image = self.layer_norm2(self_attended_image + attended_image)
         return self_attended_image
-    
+
 
 class ImageToTextAttentionLayer(nn.Module):
     def __init__(self, emb_dim, dropout_rate=0.1):
-        super(ImageToTextAttentionLayer, self).__init__()
-
-        self.cross_attention = MultiHeadAttention(
-            emb_dim, heads=4, dropout_rate=dropout_rate
-        )
-        self.self_attention = MultiHeadAttention(
-            emb_dim, heads=4, dropout_rate=0.1
-        )
-
+        super().__init__()
+        self.cross_attention = MultiHeadAttention(emb_dim, heads=4, dropout_rate=dropout_rate)
+        self.self_attention = MultiHeadAttention(emb_dim, heads=4, dropout_rate=0.1)
         self.layer_norm1 = nn.LayerNorm(emb_dim)
         self.layer_norm2 = nn.LayerNorm(emb_dim)
-
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, text, image):
-
         attended_text = self.cross_attention(image, image, text)
         attended_text = self.dropout(attended_text)
-        attended_text = self.layer_norm1(attended_text + text)  # Residual connection
+        attended_text = self.layer_norm1(attended_text + text)
 
-        self_attended_text = self.self_attention(
-            attended_text, attended_text, attended_text
-        )
+        self_attended_text = self.self_attention(attended_text, attended_text, attended_text)
         self_attended_text = self.dropout(self_attended_text)
-        self_attended_text = self.layer_norm2(
-            self_attended_text + attended_text
-        )  # Residual connection
-
+        self_attended_text = self.layer_norm2(self_attended_text + attended_text)
         return self_attended_text
-    
-class CrossModel(nn.Module):
 
+
+# ------------------------------
+# CrossModel
+# ------------------------------
+class CrossModel(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(classnames, clip_model)
@@ -531,139 +460,117 @@ class CrossModel(nn.Module):
         assert (self.attend_img + self.attend_txt + self.attend_both) == 1
 
         if self.attend_img or self.attend_both:
-            self.image_attention = nn.ModuleList(
-                [
-                    TextToImageAttentionLayer(emb_dim=512, dropout_rate=0.1)
-                    for _ in range(2)
-                ]
-            )
+            self.image_attention = nn.ModuleList([TextToImageAttentionLayer(emb_dim=512) for _ in range(2)])
         if self.attend_txt or self.attend_both:
-            self.text_attention = nn.ModuleList(
-                [
-                    ImageToTextAttentionLayer(emb_dim=512, dropout_rate=0.1)
-                    for _ in range(2)
-                ]
-            )
+            self.text_attention = nn.ModuleList([ImageToTextAttentionLayer(emb_dim=512) for _ in range(2)])
 
         self.relation = torch.Tensor(np.load(cfg.relation_file))
-        self.parent_index = np.load(cfg.super_labels_index)
-        self.parent_index = torch.Tensor(self.parent_index).type(torch.long)
+        self.parent_index = torch.Tensor(np.load(cfg.super_labels_index)).type(torch.long)
 
-        child = self.relation[:cfg.child_num, :cfg.child_num].clone()
-        parent = self.relation[cfg.child_num:, cfg.child_num:].clone()
+        child = self.relation[: cfg.child_num, : cfg.child_num].clone()
+        parent = self.relation[cfg.child_num :, cfg.child_num :].clone()
         child = self.split(child)
         parent = self.split(parent)
-        
+
         self.parent_self = parent.clone()
         self.relation = child
 
     def split(self, relation):
-        _ ,max_idx = torch.topk(relation, int(3/4 * len(relation)))
+        _, max_idx = torch.topk(relation, int(3 / 4 * len(relation)))
         mask = torch.ones_like(relation).type(torch.bool)
         for i, idx in enumerate(max_idx):
             mask[i][idx] = 0
         relation[mask] = 0
-        dialog = torch.eye(len(relation)).type(torch.bool)
-        relation[dialog] = 0
-        relation = relation / torch.sum(relation, dim=1).reshape(-1, 1) * cfg.reweight_p 
-        relation[dialog] = (1-cfg.reweight_p)
+        diag = torch.eye(len(relation)).type(torch.bool)
+        relation[diag] = 0
+        relation = relation / torch.sum(relation, dim=1).reshape(-1, 1) * cfg.reweight_p
+        relation[diag] = (1 - cfg.reweight_p)
         return relation
-    
-    def attend_to_img(self,text_labels,image,label): # 110,512   32,512  32,110
+
+    def attend_to_img(self, text_labels, image, label):
         if self.training:
-            mask = label.unsqueeze(-1) # 32,110,1
-        image = image.unsqueeze(1) # 32,1,512
-        text_labels = text_labels.unsqueeze(0).repeat(image.shape[0],1,1) # 32,110,512
+            mask = label.unsqueeze(-1)
+        image = image.unsqueeze(1)
+        text_labels = text_labels.unsqueeze(0).repeat(image.shape[0], 1, 1)
         if self.training:
-            text_labels = text_labels * mask # 32,110,512
+            text_labels = text_labels * mask
+
         img = []
         for i in range(text_labels.shape[1]):
-            text = text_labels[:,i,:] # 32,512
-            im = image # 32,1,512
+            text = text_labels[:, i, :]
+            im = image
             for layer in self.image_attention:
-                im = layer(text,im) # 32,1,512
-            im = im.squeeze(1) # 32,512
+                im = layer(text, im)
+            im = im.squeeze(1)
             img.append(im)
 
-        image_features = torch.stack(img) # 110,32,512
-        image_features = image_features.permute(1,0,2) # 32,110,512
+        image_features = torch.stack(img).permute(1, 0, 2)
         if self.training:
-            image_features = image_features * mask # 32,110,512
-            num_ones = mask.sum(dim=1) # 32,1
+            image_features = image_features * mask
+            num_ones = mask.sum(dim=1)
             image_features_sum = image_features.sum(dim=1)
-            mean_image_features = image_features_sum/num_ones.clamp(min=1)
-            mean_image_features = torch.where(num_ones==0,image,mean_image_features) #32,512
+            mean_image_features = image_features_sum / num_ones.clamp(min=1)
+            mean_image_features = torch.where(num_ones == 0, image.squeeze(1), mean_image_features)
             return mean_image_features
         else:
             return text_labels, image_features
-    
-    def attend_to_text(self,text_labels,image1,label): # 110,512   32,512   32,110
-        image = image1.unsqueeze(1) # 32,1,512
-        text_labels = text_labels.unsqueeze(0).repeat(image.shape[0],1,1) # 32,110,512
+
+    def attend_to_text(self, text_labels, image1, label):
+        text_labels = text_labels.unsqueeze(0).repeat(image1.shape[0], 1, 1)
         txt = []
         for i in range(text_labels.shape[1]):
-            text = text_labels[:,i,:] # 32,512
+            text = text_labels[:, i, :]
             if self.training:
-                labels = label[:,i].unsqueeze(1) # 32
-            tx = text.unsqueeze(1) # 32,1,512
+                labels = label[:, i].unsqueeze(1)
+            tx = text.unsqueeze(1)
             for layer in self.text_attention:
-                tx = layer(tx,image1) # 32,1,512
-            tx = tx.squeeze(1) # 32,512
+                tx = layer(tx, image1)
+            tx = tx.squeeze(1)
             if self.training:
-                tx = torch.where(labels==0,text,tx)
+                tx = torch.where(labels == 0, text, tx)
             txt.append(tx)
-
-        text_features = torch.stack(txt) # 110,32,512
-        text_features = text_features.permute(1,0,2) # 32,110,512
+        text_features = torch.stack(txt).permute(1, 0, 2)
         return text_features
-    
-    def forward(self, image, target = None):
-        prompts = self.prompt_learner()
-        text_features = self.text_encoder(prompts,self.tokenized_prompts)
 
+    def forward(self, image, target=None):
+        prompts = self.prompt_learner()
+        text_features = self.text_encoder(prompts, self.tokenized_prompts)
         text_features = self.gcn(text_features, self.relation)
-        
-        text_features = text_features / text_features.norm(dim=-1,
-                                                            keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
         logit_scale = self.logit_scale.exp()
-        print(f"Logit scale: {logit_scale}")
-    
+
         image_features = self.image_encoder(image)
-        image_features = image_features / image_features.norm(dim=-1,
-                                                              keepdim=True)
-        
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
         if self.attend_txt:
-            text_features = self.attend_to_text(text_features,image_features,target)
+            text_features = self.attend_to_text(text_features, image_features, target)
             image_features = image_features.unsqueeze(1)
-            #print(f"text feat: {text_features}")
-            logits = logit_scale * torch.matmul(image_features,text_features.transpose(-1,-2)).squeeze(1)
-        if self.attend_img:
+            logits = logit_scale * torch.matmul(image_features, text_features.transpose(-1, -2)).squeeze(1)
+        elif self.attend_img:
             if self.training:
-                image_features = self.attend_to_img(text_features,image_features,target)
+                image_features = self.attend_to_img(text_features, image_features, target)
                 logits = logit_scale * (image_features @ text_features.t())
             else:
-                text_features, image_features = self.attend_to_img(text_features,image_features,target)
-                # print(f"Img feat: {image_features.shape}")
-                # print(f"txt feat: {text_features.shape}")
-                logits = logit_scale * (image_features*text_features).sum(dim=-1)
-        if self.attend_both:
-            tf = self.attend_to_text(text_features,image_features,target)
-            imf = self.attend_to_img(text_features,image_features,target).unsqueeze(1)
-            logits = logit_scale * torch.matmul(imf,tf.transpose(-1,-2)).squeeze(1)
-
-        # if not self.training:
-        #     print(logits.shape)
+                text_features, image_features = self.attend_to_img(text_features, image_features, target)
+                logits = logit_scale * (image_features * text_features).sum(dim=-1)
+        else:
+            tf = self.attend_to_text(text_features, image_features, target)
+            imf = self.attend_to_img(text_features, image_features, target).unsqueeze(1)
+            logits = logit_scale * torch.matmul(imf, tf.transpose(-1, -2)).squeeze(1)
 
         return logits
 
-class MMLSurgAdapt(nn.Module):
 
+# ------------------------------
+# Baselines
+# ------------------------------
+class MMLSurgAdapt(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
@@ -671,166 +578,95 @@ class MMLSurgAdapt(nn.Module):
         self.gcn = GCN()
 
         self.relation = torch.Tensor(np.load(cfg.relation_file))
-        self.parent_index = np.load(cfg.super_labels_index)
-        self.parent_index = torch.Tensor(self.parent_index).type(torch.long)
+        self.parent_index = torch.Tensor(np.load(cfg.super_labels_index)).type(torch.long)
 
-        child = self.relation[:cfg.child_num, :cfg.child_num].clone()
-        parent = self.relation[cfg.child_num:, cfg.child_num:].clone()
+        child = self.relation[: cfg.child_num, : cfg.child_num].clone()
+        parent = self.relation[cfg.child_num :, cfg.child_num :].clone()
         child = self.split(child)
         parent = self.split(parent)
-        
+
         self.parent_self = parent.clone()
         self.relation = child
 
     def split(self, relation):
-        _ ,max_idx = torch.topk(relation, int(3/4 * len(relation)))
+        _, max_idx = torch.topk(relation, int(3 / 4 * len(relation)))
         mask = torch.ones_like(relation).type(torch.bool)
         for i, idx in enumerate(max_idx):
             mask[i][idx] = 0
         relation[mask] = 0
-        dialog = torch.eye(len(relation)).type(torch.bool)
-        relation[dialog] = 0
-        relation = relation / torch.sum(relation, dim=1).reshape(-1, 1) * cfg.reweight_p 
-        relation[dialog] = (1-cfg.reweight_p)
+        diag = torch.eye(len(relation)).type(torch.bool)
+        relation[diag] = 0
+        relation = relation / torch.sum(relation, dim=1).reshape(-1, 1) * cfg.reweight_p
+        relation[diag] = (1 - cfg.reweight_p)
         return relation
-    
-    def encode_text(self, prompts, tokenized_prompts, text_adapter_func=None):
-        if text_adapter_func is not None:
-            text_features = self.text_encoder(
-                prompts, tokenized_prompts, text_adapter_func
-            )
-        else:
-            text_features = self.text_encoder(
-                prompts, tokenized_prompts
-            )
-        return text_features
-    
+
     def encode_image(self, image, visual_adapter_func=None):
         if visual_adapter_func is not None:
-            image_features = self.image_encoder(
-                [image.type(self.dtype), visual_adapter_func]
-            )
-        else:
-            image_features = self.image_encoder(
-                image.type(self.dtype)
-            )
-        return image_features
-    
+            return self.image_encoder([image.type(self.dtype), visual_adapter_func])
+        return self.image_encoder(image.type(self.dtype))
+
     def forward(self, image):
-
-        child_prompts = self.prompt_learner()
-
-        child_text_features = self.text_encoder(child_prompts,self.tokenized_prompts)
-
-        text_features = child_text_features
-
+        prompts = self.prompt_learner()
+        text_features = self.text_encoder(prompts, self.tokenized_prompts)
         text_features = self.gcn(text_features, self.relation)
-        
-        text_features = text_features / text_features.norm(dim=-1,
-                                                            keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
         image_features = self.encode_image(image)
-        image_features = image_features / image_features.norm(dim=-1,
-                                                              keepdim=True)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
         logits = 10 * image_features @ text_features.t()
         return logits
 
-class VLPL(nn.Module):
 
+class VLPL(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         self.child_prompt_learner = PromptLearner(classnames, clip_model)
         self.child_tokeninzed_prompts = self.child_prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
         self.temp = 0.03
 
-        self.gcn = GCN()
-
-        self.relation = torch.Tensor(np.load(cfg.relation_file))
-        self.parent_index = np.load(cfg.super_labels_index)
-        self.parent_index = torch.Tensor(self.parent_index).type(torch.long)
-
-        child = self.relation[:cfg.child_num, :cfg.child_num].clone()
-        parent = self.relation[cfg.child_num:, cfg.child_num:].clone()
-        child = self.split(child)
-        parent = self.split(parent)
-        
-        self.parent_self = parent.clone()
-        self.relation = child
-
-    def split(self, relation):
-        _ ,max_idx = torch.topk(relation, int(3/4 * len(relation)))
-        mask = torch.ones_like(relation).type(torch.bool)
-        for i, idx in enumerate(max_idx):
-            mask[i][idx] = 0
-        relation[mask] = 0
-        dialog = torch.eye(len(relation)).type(torch.bool)
-        relation[dialog] = 0
-        relation = relation / torch.sum(relation, dim=1).reshape(-1, 1) * cfg.reweight_p 
-        relation[dialog] = (1-cfg.reweight_p)
-        return relation
-    
-    def encode_text(self, prompts, tokenized_prompts, text_adapter_func=None):
-        if text_adapter_func is not None:
-            text_features = self.text_encoder(
-                prompts, tokenized_prompts, text_adapter_func
-            )
-        else:
-            text_features = self.text_encoder(
-                prompts, tokenized_prompts
-            )
-        return text_features
-    
     def encode_image(self, image, visual_adapter_func=None):
         if visual_adapter_func is not None:
-            image_features = self.image_encoder(
-                [image.type(self.dtype), visual_adapter_func]
-            )
-        else:
-            image_features = self.image_encoder(
-                image.type(self.dtype)
-            )
-        return image_features
-    
+            return self.image_encoder([image.type(self.dtype), visual_adapter_func])
+        return self.image_encoder(image.type(self.dtype))
+
     def forward(self, image):
-        child_prompts = self.child_prompt_learner()
-        child_text_features = self.text_encoder(child_prompts,self.child_tokeninzed_prompts)
+        prompts = self.child_prompt_learner()
+        text_features = self.text_encoder(prompts, self.child_tokeninzed_prompts)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        text_features = child_text_features
-        
-        text_features = text_features / text_features.norm(dim=-1,
-                                                            keepdim=True)
         image_features = self.encode_image(image)
-        image_features = image_features / image_features.norm(dim=-1,
-                                                              keepdim=True)
-        logits = (1/self.temp) * image_features @ text_features.t()
-        return logits
-    
-class Resnet(nn.Module):
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
+        logits = (1 / self.temp) * image_features @ text_features.t()
+        return logits
+
+
+class Resnet(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         self.image_encoder = models.resnet50(pretrained=True)
-        self.image_encoder.fc = nn.Linear(self.image_encoder.fc.in_features,len(classnames))
-    
+        self.image_encoder.fc = nn.Linear(self.image_encoder.fc.in_features, len(classnames))
+
     def forward(self, image):
         return self.image_encoder(image)
-    
-class ViT(nn.Module):
 
+
+class ViT(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         self.image_encoder = models.vit_b_16(weights="ViT_B_16_Weights.DEFAULT")
         self.image_encoder.heads = nn.Sequential(nn.Linear(self.image_encoder.heads[0].in_features, len(classnames)))
-        
+
     def forward(self, image):
         return self.image_encoder(image)
-    
-class CLIP_for_train(nn.Module):
 
+
+class CLIP_for_train(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(classnames, clip_model)
@@ -841,713 +677,283 @@ class CLIP_for_train(nn.Module):
         self.dtype = clip_model.dtype
 
     def forward(self, image):
+        prompts = self.prompt_learner()
+        text_features = self.text_encoder(prompts, self.tokenized_prompts)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        child_prompts = self.prompt_learner()
-        text_features = self.text_encoder(child_prompts,self.tokenized_prompts)
-        
-        text_features = text_features / text_features.norm(dim=-1,
-                                                            keepdim=True)
         logit_scale = self.logit_scale.exp()
         image_features = self.image_encoder(image)
-        image_features = image_features / image_features.norm(dim=-1,
-                                                                keepdim=True)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
         logits = logit_scale * image_features @ text_features.t()
         return logits
-    
-class HSPNet(nn.Module):
 
+
+class HSPNet(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
         self.parent_prompt_learner = ParentPromptLearner(None, clip_model)
         self.child_prompt_learner = ChildPromptLearner(classnames, clip_model)
         self.parent_tokenized_prompts = self.parent_prompt_learner.tokenized_prompts
         self.child_tokeninzed_prompts = self.child_prompt_learner.tokenized_prompts
+
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
         self.gcn = GCN()
-
         self.relation = torch.Tensor(np.load(cfg.relation_file))
-        self.parent_index = np.load(cfg.super_labels_index)
-        self.parent_index = torch.Tensor(self.parent_index).type(torch.long)
 
-        child = self.relation[:cfg.child_num, :cfg.child_num].clone()
-        parent = self.relation[cfg.child_num:, cfg.child_num:].clone()
+        child = self.relation[: cfg.child_num, : cfg.child_num].clone()
+        parent = self.relation[cfg.child_num :, cfg.child_num :].clone()
         child = self.split(child)
         parent = self.split(parent)
-        
+
         self.parent_self = parent.clone()
         self.relation = child
 
     def split(self, relation):
-        _ ,max_idx = torch.topk(relation, int(3/4 * len(relation)))
+        _, max_idx = torch.topk(relation, int(3 / 4 * len(relation)))
         mask = torch.ones_like(relation).type(torch.bool)
         for i, idx in enumerate(max_idx):
             mask[i][idx] = 0
         relation[mask] = 0
-        dialog = torch.eye(len(relation)).type(torch.bool)
-        relation[dialog] = 0
-        relation = relation / torch.sum(relation, dim=1).reshape(-1, 1) * cfg.reweight_p 
-        relation[dialog] = (1-cfg.reweight_p)
+        diag = torch.eye(len(relation)).type(torch.bool)
+        relation[diag] = 0
+        relation = relation / torch.sum(relation, dim=1).reshape(-1, 1) * cfg.reweight_p
+        relation[diag] = (1 - cfg.reweight_p)
         return relation
-    
+
     def forward(self, image):
         image_features = self.image_encoder(image.type(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1,
-                                                              keepdim=True)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
         parent_prompts = self.parent_prompt_learner()
         parent_text_features = self.text_encoder(parent_prompts, self.parent_tokenized_prompts)
-        
         parent_text_features = self.gcn(parent_text_features, self.parent_self)
+
         child_prompts = self.child_prompt_learner(parent_text_features)
         child_text_features = self.text_encoder(child_prompts, self.child_tokeninzed_prompts)
 
-        text_features = child_text_features
+        text_features = self.gcn(child_text_features, self.relation)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        text_features = self.gcn(text_features, self.relation)
-        
-        text_features = text_features / text_features.norm(dim=-1,
-                                                            keepdim=True)
         logits = 10 * image_features @ text_features.t()
         return logits
 
-class CoOpPromptLearner(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        if hasattr(cfg, 'child_num') and cfg.child_num > 0: classnames = classnames[0:cfg.child_num]
-        n_cls, n_ctx = len(classnames), cfg.child_n_ctx if hasattr(cfg, 'child_n_ctx') else 16
-        dtype, ctx_dim = clip_model.dtype, clip_model.ln_final.weight.shape[0]
-        logger.info("Initializing CoOp prompts..."); ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype); nn.init.normal_(ctx_vectors, std=0.02)
-        self.ctx = nn.Parameter(ctx_vectors)
-        prompt_prefix = " ".join(["X"] * n_ctx)
-        prompts = [prompt_prefix + " " + name.replace("_", " ") + "." for name in classnames]
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        with torch.no_grad(): embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-        self.register_buffer("token_prefix", embedding[:, :1, :]); self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
-        self.n_cls = n_cls; self.tokenized_prompts = tokenized_prompts
-    def forward(self):
-        return torch.cat([self.token_prefix, self.ctx.unsqueeze(0).expand(self.n_cls, -1, -1), self.token_suffix], dim=1)
 
-class MMLSurgAdaptCoOp(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__(); self.prompt_learner = CoOpPromptLearner(classnames, clip_model); self.text_encoder = TextEncoder(clip_model)
-        self.image_encoder = clip_model.visual; self.logit_scale = clip_model.logit_scale; self.dtype = clip_model.dtype
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype)); prompts = self.prompt_learner()
-        text_features = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts)
-        image_features = F.normalize(image_features, p=2, dim=-1); text_features = F.normalize(text_features, p=2, dim=-1)
-        return self.logit_scale.exp() * image_features @ text_features.t()
-
-# ==================== DualCoOp (双静态提示) 实现 ====================
-class DualCoOpPromptLearner(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        if hasattr(cfg, 'child_num') and cfg.child_num > 0: classnames = classnames[0:cfg.child_num]
-        n_cls, n_ctx = len(classnames), cfg.child_n_ctx if hasattr(cfg, 'child_n_ctx') else 16
-        dtype, ctx_dim = clip_model.dtype, clip_model.ln_final.weight.shape[0]
-        logger.info("Initializing DualCoOp prompts...")
-        ctx_vectors_pos = torch.empty(n_ctx, ctx_dim, dtype=dtype); nn.init.normal_(ctx_vectors_pos, std=0.02)
-        ctx_vectors_neg = torch.empty(n_ctx, ctx_dim, dtype=dtype); nn.init.normal_(ctx_vectors_neg, std=0.02)
-        self.ctx_pos = nn.Parameter(ctx_vectors_pos); self.ctx_neg = nn.Parameter(ctx_vectors_neg)
-        prompt_prefix = " ".join(["X"] * n_ctx)
-        prompts = [prompt_prefix + " " + name.replace("_", " ") + "." for name in classnames]
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        with torch.no_grad(): embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-        self.register_buffer("token_prefix", embedding[:, :1, :]); self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
-        self.n_cls = n_cls; self.tokenized_prompts = tokenized_prompts
-    def forward(self):
-        ctx_pos = self.ctx_pos.unsqueeze(0).expand(self.n_cls, -1, -1); ctx_neg = self.ctx_neg.unsqueeze(0).expand(self.n_cls, -1, -1)
-        prompts_pos = torch.cat([self.token_prefix, ctx_pos, self.token_suffix], dim=1)
-        prompts_neg = torch.cat([self.token_prefix, ctx_neg, self.token_suffix], dim=1)
-        return prompts_pos, prompts_neg
-
-class MMLSurgAdaptDualCoOp(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__(); self.prompt_learner = DualCoOpPromptLearner(classnames, clip_model); self.text_encoder = TextEncoder(clip_model)
-        self.image_encoder = clip_model.visual; self.logit_scale = clip_model.logit_scale; self.dtype = clip_model.dtype
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype)); prompts_pos, prompts_neg = self.prompt_learner()
-        text_features_pos = self.text_encoder(prompts_pos, self.prompt_learner.tokenized_prompts)
-        text_features_neg = self.text_encoder(prompts_neg, self.prompt_learner.tokenized_prompts)
-        image_features, text_features_pos, text_features_neg = map(lambda t: F.normalize(t, p=2, dim=-1), (image_features, text_features_pos, text_features_neg))
-        logits_pos = self.logit_scale.exp() * image_features @ text_features_pos.t()
-        logits_neg = self.logit_scale.exp() * image_features @ text_features_neg.t()
-        return logits_pos - logits_neg
-
-# ==================== CoCoOp (动态提示) 实现 ====================
-class CoCoOpPromptLearner(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        if hasattr(cfg, 'child_num') and cfg.child_num > 0: classnames = classnames[0:cfg.child_num]
-        n_cls, n_ctx = len(classnames), cfg.child_n_ctx if hasattr(cfg, 'child_n_ctx') else 16
-        dtype, ctx_dim, vis_dim = clip_model.dtype, clip_model.ln_final.weight.shape[0], clip_model.visual.output_dim
-        logger.info("Initializing CoCoOp prompts with MetaNet..."); ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype); nn.init.normal_(ctx_vectors, std=0.02)
-        self.ctx = nn.Parameter(ctx_vectors)
-        self.meta_net = nn.Sequential(OrderedDict([("linear1", nn.Linear(vis_dim, vis_dim // 16)), ("relu", nn.ReLU(inplace=True)), ("linear2", nn.Linear(vis_dim // 16, ctx_dim))]))
-        if dtype == torch.float16: self.meta_net.half()
-        prompt_prefix = " ".join(["X"] * n_ctx); prompts = [prompt_prefix + " " + name.replace("_", " ") + "." for name in classnames]
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        with torch.no_grad(): embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-        self.register_buffer("token_prefix", embedding[:, :1, :]); self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
-        self.n_cls = n_cls; self.tokenized_prompts = tokenized_prompts
-    def forward(self, im_features):
-        batch_size = im_features.shape[0]; bias = self.meta_net(im_features).unsqueeze(1)
-        ctx_shifted = (self.ctx.unsqueeze(0) + bias).unsqueeze(1).expand(-1, self.n_cls, -1, -1)
-        prefix = self.token_prefix.unsqueeze(0).expand(batch_size, -1, -1, -1); suffix = self.token_suffix.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        return torch.cat([prefix, ctx_shifted, suffix], dim=2)
-
-class MMLSurgAdaptCoCoOp(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__(); self.prompt_learner = CoCoOpPromptLearner(classnames, clip_model); self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model); self.logit_scale = clip_model.logit_scale; self.dtype = clip_model.dtype
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype)); prompts = self.prompt_learner(image_features)
-        batch_size, n_cls, n_tkn, dim = prompts.shape; tokenized_prompts = self.prompt_learner.tokenized_prompts.repeat(batch_size, 1)
-        prompts = prompts.reshape(batch_size * n_cls, n_tkn, dim)
-        text_features = self.text_encoder(prompts, tokenized_prompts).reshape(batch_size, n_cls, -1)
-        image_features_norm = F.normalize(image_features, p=2, dim=-1); text_features_norm = F.normalize(text_features, p=2, dim=-1)
-        return self.logit_scale.exp() * torch.einsum('bd,bcd->bc', image_features_norm, text_features_norm)
-
-# ==================== DualCoCoOp (双动态提示) 实现 [新增+修正] ====================
-class DualCoCoOpPromptLearner(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        if hasattr(cfg, 'child_num') and cfg.child_num > 0: classnames = classnames[0:cfg.child_num]
-        n_cls, n_ctx = len(classnames), cfg.child_n_ctx if hasattr(cfg, 'child_n_ctx') else 16
-        dtype, ctx_dim, vis_dim = clip_model.dtype, clip_model.ln_final.weight.shape[0], clip_model.visual.output_dim
-        logger.info("Initializing DualCoCoOp prompts with MetaNet...")
-        ctx_vectors_pos = torch.empty(n_ctx, ctx_dim, dtype=dtype); nn.init.normal_(ctx_vectors_pos, std=0.02)
-        ctx_vectors_neg = torch.empty(n_ctx, ctx_dim, dtype=dtype); nn.init.normal_(ctx_vectors_neg, std=0.02)
-        self.ctx_pos = nn.Parameter(ctx_vectors_pos); self.ctx_neg = nn.Parameter(ctx_vectors_neg)
-        self.meta_net = nn.Sequential(OrderedDict([("linear1", nn.Linear(vis_dim, vis_dim // 16)), ("relu", nn.ReLU(inplace=True)), ("linear2", nn.Linear(vis_dim // 16, ctx_dim))]))
-        if dtype == torch.float16: self.meta_net.half()
-        prompt_prefix = " ".join(["X"] * n_ctx); prompts = [prompt_prefix + " " + name.replace("_", " ") + "." for name in classnames]
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        with torch.no_grad(): embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-        self.register_buffer("token_prefix", embedding[:, :1, :]); self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
-        self.n_cls = n_cls; self.tokenized_prompts = tokenized_prompts
-    def forward(self, im_features):
-        batch_size = im_features.shape[0]; bias = self.meta_net(im_features).unsqueeze(1)
-        ctx_pos_shifted = (self.ctx_pos.unsqueeze(0) + bias).unsqueeze(1).expand(-1, self.n_cls, -1, -1)
-        ctx_neg_shifted = (self.ctx_neg.unsqueeze(0) + bias).unsqueeze(1).expand(-1, self.n_cls, -1, -1)
-        prefix = self.token_prefix.unsqueeze(0).expand(batch_size, -1, -1, -1); suffix = self.token_suffix.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        prompts_pos = torch.cat([prefix, ctx_pos_shifted, suffix], dim=2)
-        prompts_neg = torch.cat([prefix, ctx_neg_shifted, suffix], dim=2)
-        return prompts_pos, prompts_neg
-
-class MMLSurgAdaptDualCoCoOp(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__(); self.prompt_learner = DualCoCoOpPromptLearner(classnames, clip_model); self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model); self.logit_scale = clip_model.logit_scale; self.dtype = clip_model.dtype
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype)); prompts_pos, prompts_neg = self.prompt_learner(image_features)
-        batch_size, n_cls, n_tkn, dim = prompts_pos.shape; tokenized_prompts = self.prompt_learner.tokenized_prompts.repeat(batch_size, 1)
-        prompts_pos = prompts_pos.reshape(batch_size * n_cls, n_tkn, dim); prompts_neg = prompts_neg.reshape(batch_size * n_cls, n_tkn, dim)
-        text_features_pos = self.text_encoder(prompts_pos, tokenized_prompts).reshape(batch_size, n_cls, -1)
-        text_features_neg = self.text_encoder(prompts_neg, tokenized_prompts).reshape(batch_size, n_cls, -1)
-        image_features, text_features_pos, text_features_neg = map(lambda t: F.normalize(t, p=2, dim=-1), (image_features, text_features_pos, text_features_neg))
-        logits_pos = self.logit_scale.exp() * torch.einsum('bd,bcd->bc', image_features, text_features_pos)
-        logits_neg = self.logit_scale.exp() * torch.einsum('bd,bcd->bc', image_features, text_features_neg)
-        return logits_pos - logits_neg
-
-# ==================== 冻结编码器的版本 (Prompt Tuning) ====================
-def freeze_encoders(model, model_name):
-    logger.info(f"Initializing {model_name}: Freezing CLIP encoders for prompt tuning.")
-    for name, param in model.named_parameters():
-        if "prompt_learner" not in name: param.requires_grad = False
-    model.image_encoder.eval(); model.text_encoder.eval()
-
-class MMLSurgAdaptCoOpFrozen(MMLSurgAdaptCoOp):
-    def __init__(self, classnames, clip_model): 
-        super().__init__(classnames, clip_model)
-        freeze_encoders(self, "MMLSurgAdaptCoOpFrozen")
-        
-    # [新增] 重写 train 方法，确保 encoder 永远是 eval 模式
-    def train(self, mode=True):
-        super().train(mode)
-        self.image_encoder.eval()
-        self.text_encoder.eval()
-        return self
-
-class MMLSurgAdaptDualCoOpFrozen(MMLSurgAdaptDualCoOp):
-    def __init__(self, classnames, clip_model): 
-        super().__init__(classnames, clip_model)
-        freeze_encoders(self, "MMLSurgAdaptDualCoOpFrozen")
-
-    def train(self, mode=True):
-        super().train(mode)
-        self.image_encoder.eval()
-        self.text_encoder.eval()
-        return self
-class MMLSurgAdaptCoCoOpFrozen(MMLSurgAdaptCoCoOp):
-    def __init__(self, classnames, clip_model): 
-        super().__init__(classnames, clip_model)
-        freeze_encoders(self, "MMLSurgAdaptCoCoOpFrozen")
-        
-    # [新增] 重写 train 方法，确保 encoder 永远是 eval 模式
-    def train(self, mode=True):
-        super().train(mode)
-        self.image_encoder.eval()
-        self.text_encoder.eval()
-        return self
-    
-# 1. 文本特征自注意力模块 (TextSelfAttention) - 替代 GCN
-class TextSelfAttention(nn.Module):
-    """
-    Transformer Encoder blocks for Self-Attention on Text/Class Embeddings.
-    输入和输出形状：[N_cls, D_embed]。
-    """
-    def __init__(self, embed_dim, num_layers=2, heads=8, dropout_rate=0.1):
-        super(TextSelfAttention, self).__init__()
-        
-        # 模块参数与 GCN 类中的维度保持一致
-        self_attn_layer = lambda: MultiHeadAttention(embed_dim, heads=heads, dropout_rate=dropout_rate)
-        
-        encoder_layers = []
-        for _ in range(num_layers): # 默认使用 2 层
-            layer = nn.ModuleDict({
-                'norm1': nn.LayerNorm(embed_dim),
-                'attn': self_attn_layer(),
-                'norm2': nn.LayerNorm(embed_dim),
-                'mlp': nn.Sequential(
-                    nn.Linear(embed_dim, embed_dim * 4),
-                    nn.GELU(),
-                    nn.Linear(embed_dim * 4, embed_dim),
-                    nn.Dropout(dropout_rate)
-                )
-            })
-            encoder_layers.append(layer)
-        
-        self.layers = nn.ModuleList(encoder_layers)
-
-    def forward(self, x):
-        # x shape: [N_cls, D] -> 转换为 [1, N_cls, D] 以适应 MultiHeadAttention
-        x = x.unsqueeze(0) 
-        
-        for layer in self.layers:
-            residual = x
-            x_norm = layer['norm1'](x)
-            attn_output = layer['attn'](x_norm, x_norm, x_norm) 
-            x = residual + attn_output 
-
-            residual = x
-            x_norm = layer['norm2'](x)
-            x = residual + layer['mlp'](x_norm) 
-
-        return x.squeeze(0) # 移除 Batch 维度，返回 [N_cls, D]
-
-
-# 2. 主模型类：CLIP_TextAttention (CLIP + Text Attention，无 Prompt Learner)
-class CLIP_TextAttention(nn.Module):
-    """
-    模仿 CLIP_for_train，使用固定文本模板，并替换 GCN 为 Text Attention。
-    """
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        
-        # 1. CLIP Encoders 和参数
-        self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
-        
-        # 2. 固定文本嵌入 (Fixed Text Embeddings)
-        # 模仿 PromptLearner 的目标，但使用固定文本模板
-        classnames = classnames[0:cfg.child_num]
-        classnames = [name.replace("_", " ") for name in classnames]
-        
-        # 使用配置中的 child_ctx_init 作为前缀，或者默认使用 CLIP 的 'a photo of a'
-        if hasattr(cfg, 'child_ctx_init') and cfg.child_ctx_init:
-            template = cfg.child_ctx_init.strip() + " {}."
-        else:
-            template = "a photo of a {}."
-            
-        prompts = [template.format(name) for name in classnames]
-        
-        self.tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        
-        # 在初始化时计算固定文本嵌入的 Tensor (固定前缀+后缀)
-        # 编码器参数和位置嵌入都是固定的，所以只保留 token embedding 中间的部分
-        with torch.no_grad():
-            prompts_full_embedding = clip_model.token_embedding(self.tokenized_prompts).type(self.dtype)
-        
-        # 模仿 CLIP_for_train 中的 tokenized_prompts 作为 prompts 输入
-        self.register_buffer("fixed_prompts_tensor", prompts_full_embedding)
-        
-        # 3. Text Attention Module
-        embed_dim = clip_model.text_projection.shape[1] 
-        self.text_attention_module = TextSelfAttention(
-            embed_dim=embed_dim, 
-            num_layers=2, 
-            heads=8
-        )
-
-    def forward(self, image):
-        # 1. 图像特征编码
-        image_features = self.image_encoder(image.type(self.dtype))
-        image_features = F.normalize(image_features, p=2, dim=-1)
-
-        # 2. 文本特征编码 (使用固定的 prompts tensor)
-        # 这里的 fixed_prompts_tensor 包含了 SOS, EOS 等 token 嵌入
-        text_features = self.text_encoder(self.fixed_prompts_tensor, self.tokenized_prompts)
-        
-        # 3. 文本特征增强 (Self-Attention)
-        # text_features shape: [N_cls, D]
-        text_features = self.text_attention_module(text_features) 
-        
-        # 4. Final Logits
-        text_features = F.normalize(text_features, p=2, dim=-1)
-        logit_scale = self.logit_scale.exp()
-        
-        logits = logit_scale * image_features @ text_features.t()
-        return logits
-    
-class CLIP_TextAttentionCoOp(nn.Module):
-    """
-    集成 CoOp (可学习提示) 到 CLIP_TextAttention。
-    - 替换固定的文本嵌入为可学习的 CoOp 提示。
-    - TextSelfAttention 作用于经过 CoOp 优化的特征，建模类别关系。
-    """
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        
-        # 1. CLIP Encoders 和参数 (冻结或训练，取决于外部配置)
-        self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
-        
-        # 2. **核心修改：使用 CoOpPromptLearner 替换固定文本**
-        # 实例化您已经定义的 CoOpPromptLearner
-        self.prompt_learner = CoOpPromptLearner(classnames, clip_model) 
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
-        
-        # 3. Text Attention Module (保持不变，作用于编码后的特征)
-        # embed_dim 应该与 TextEncoder 输出特征的维度一致 (text_projection 的维度)
-        embed_dim = clip_model.text_projection.shape[1]
-        self.text_attention_module = TextSelfAttention(
-            embed_dim=embed_dim, 
-            num_layers=2, 
-            heads=8
-        )
-
-    def forward(self, image):
-        # 1. 图像特征编码
-        image_features = self.image_encoder(image.type(self.dtype))
-        image_features = F.normalize(image_features, p=2, dim=-1)
-
-        # 2. **生成可学习的 prompts embedding**
-        # 调用 CoOpPromptLearner 的 forward 方法，获取 prompts embedding
-        prompts = self.prompt_learner() # prompts shape: [N_cls, N_tkn, D]
-        
-        # 3. 文本特征编码 (使用可学习 prompts)
-        # TextEncoder 将 prompts embedding (N_cls, N_tkn, D) 编码为最终特征 (N_cls, D)
-        text_features = self.text_encoder(prompts, self.tokenized_prompts)
-        
-        # 4. 文本特征增强 (TextSelfAttention 作用于编码后的特征)
-        # TextSelfAttention 输入 [N_cls, D] -> 输出 [N_cls, D]
-        text_features = self.text_attention_module(text_features) 
-        
-        # 5. Final Logits
-        text_features = F.normalize(text_features, p=2, dim=-1)
-        logit_scale = self.logit_scale.exp()
-        
-        logits = logit_scale * image_features @ text_features.t()
-        return logits
-    
-class CLIPCoOpLoRA(nn.Module):
-    def __init__(self, classnames, clip_model):
-        super().__init__(); 
-        
-        # *** 注入 LoRA 适配器并冻结基座 ***
-        clip_model = add_lora_to_clip(clip_model)
-        
-        self.prompt_learner = CoOpPromptLearner(classnames, clip_model); 
-        
-        # FIX: 使用新的 LoRATextEncoder
-        self.text_encoder = LoRATextEncoder(clip_model) 
-        
-        self.image_encoder = clip_model.visual; 
-        self.logit_scale = clip_model.logit_scale; 
-        self.dtype = clip_model.dtype
-        
-    def forward(self, image):
-        # FIX 1: 图像编码器调用 (直接访问 PeftModel 内部的 base_model)
-        # 这解决了 VisionTransformer.forward() 的 TypeError
-        visual_module = self.image_encoder.base_model
-        image_features = visual_module(image.type(self.dtype)); 
-
-        prompts = self.prompt_learner()
-        
-        # FIX 2: 文本编码器调用 (现在由修正后的 LoRATextEncoder.forward 负责处理)
-        text_features = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts)
-        
-        image_features = F.normalize(image_features, p=2, dim=-1); 
-        text_features = F.normalize(text_features, p=2, dim=-1)
-        return self.logit_scale.exp() * image_features @ text_features.t()
-    
-class CLIP_TextAttentionCoOp(nn.Module):
-    """
-    集成 CoOp (可学习提示) 到 CLIP_TextAttention。
-    - 替换固定的文本嵌入为可学习的 CoOp 提示。
-    - TextSelfAttention 作用于经过 CoOp 优化的特征，建模类别关系。
-    """
-    def __init__(self, classnames, clip_model):
-        super().__init__()
-        clip_model = add_lora_to_clip(clip_model)
-        # 1. CLIP Encoders 和参数 (冻结或训练，取决于外部配置)
-        self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
-        
-        # 2. **核心修改：使用 CoOpPromptLearner 替换固定文本**
-        # 实例化您已经定义的 CoOpPromptLearner
-        self.prompt_learner = CoOpPromptLearner(classnames, clip_model) 
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
-        
-        # 3. Text Attention Module (保持不变，作用于编码后的特征)
-        # embed_dim 应该与 TextEncoder 输出特征的维度一致 (text_projection 的维度)
-        embed_dim = clip_model.text_projection.shape[1]
-        self.text_attention_module = TextSelfAttention(
-            embed_dim=embed_dim, 
-            num_layers=2, 
-            heads=8
-        )
-
-    def forward(self, image):
-        # 1. 图像特征编码
-        image_features = self.image_encoder(image.type(self.dtype))
-        image_features = F.normalize(image_features, p=2, dim=-1)
-
-        # 2. **生成可学习的 prompts embedding**
-        # 调用 CoOpPromptLearner 的 forward 方法，获取 prompts embedding
-        prompts = self.prompt_learner() # prompts shape: [N_cls, N_tkn, D]
-        
-        # 3. 文本特征编码 (使用可学习 prompts)
-        # TextEncoder 将 prompts embedding (N_cls, N_tkn, D) 编码为最终特征 (N_cls, D)
-        text_features = self.text_encoder(prompts, self.tokenized_prompts)
-        
-        # 4. 文本特征增强 (TextSelfAttention 作用于编码后的特征)
-        # TextSelfAttention 输入 [N_cls, D] -> 输出 [N_cls, D]
-        text_features = self.text_attention_module(text_features) 
-        
-        # 5. Final Logits
-        text_features = F.normalize(text_features, p=2, dim=-1)
-        logit_scale = self.logit_scale.exp()
-        
-        logits = logit_scale * image_features @ text_features.t()
-        return logits
-    
-
+# ======================================================================
+# SCPNet (minimal cfg, no garbage)
+# ======================================================================
 class StructuredPriorPrompter(nn.Module):
     def __init__(self, classnames, clip_model):
         super().__init__()
-        
-        # 参数读取
-        s_reweight = getattr(cfg, 'reweight_p', 0.2) 
-        t_smooth = getattr(cfg, 't_smooth', 0.07) 
-        sim_threshold = getattr(cfg, 'sim_threshold', 0.05) 
-        
-        if hasattr(cfg, 'child_num') and cfg.child_num > 0: 
-            classnames = classnames[0:cfg.child_num]
+
+        # only meaningful knobs
+        s_reweight = _cfg("SCP_S_REWEIGHT", _cfg("reweight_p", 0.2))
+        sim_threshold = _cfg("SCP_SIM_THRESHOLD", _cfg("sim_threshold", 0.05))
+
+        if hasattr(cfg, "child_num") and cfg.child_num > 0:
+            classnames = classnames[0 : cfg.child_num]
+
         self.n_cls = len(classnames)
         dtype = clip_model.dtype
-        
-        # 1. 计算 CLIP 特征
+
         template = "a photo of a {}."
         classnames_proc = [name.replace("_", " ") for name in classnames]
         prompts = [template.format(name) for name in classnames_proc]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        
+
         with torch.no_grad():
             z_static = clip_model.encode_text(tokenized_prompts).type(dtype)
         z_static = F.normalize(z_static, p=2, dim=-1)
-        
-        # 原始相似度 A
-        A_raw = torch.matmul(z_static, z_static.t())
-        
-        # ======================================================================
-        # 步骤 1: 必须先构建并应用互斥掩码 (Mask)
-        # 目的：在归一化之前，就把 Phase vs Phase 彻底杀死，防止它们干扰 row_max 计算
-        # ======================================================================
-        
+
+        A_raw = z_static @ z_static.t()
+
+        # write-fixed ranges (label definition)
+        phase_range = slice(0, 7)
+        view_range = slice(7, 10)
+        action_range = slice(10, self.n_cls)
+
+        # mutual-exclusive within each big group
         structure_mask = torch.ones_like(A_raw, dtype=torch.bool)
-        
-        # 0-7: Phase, 7-10: View, 10-110: Action
-        
-        # Phase vs Phase -> 互斥 (设为0)
-        structure_mask[0:7, 0:7] = False
-        # View vs View -> 互斥 (设为0)
-        structure_mask[7:10, 7:10] = False
-        structure_mask[10:110, 10:110] = False
-        # 对角线暂时保留 (后面会单独处理 Self-loop)
+        structure_mask[phase_range, phase_range] = False
+        structure_mask[view_range, view_range] = False
+        structure_mask[action_range, action_range] = False
         structure_mask.fill_diagonal_(True)
-        
-        # 应用掩码：彻底清零互斥区
+
         A_masked = A_raw * structure_mask.float()
-        
-        # ======================================================================
-        # 步骤 2: 分块最大值归一化 (Block-wise Max Norm)
-        # 现在的输入已经是被 Mask 干净的 A_masked 了
-        # ======================================================================
-        
+
+        # block-wise max norm
         A_norm = torch.zeros_like(A_masked)
-        ranges = [(0, 7), (7, 10), (10, 110)]
-        
-        for src_start, src_end in ranges:          
-            for tgt_start, tgt_end in ranges:      
-                
-                # 提取子块
+        ranges = [(0, 7), (7, 10), (10, self.n_cls)]
+        for src_start, src_end in ranges:
+            for tgt_start, tgt_end in ranges:
                 block = A_masked[src_start:src_end, tgt_start:tgt_end]
-                
-                # 特殊处理：如果是 Phase-Phase 这种已经被 Mask 成全 0 的块
-                # 直接跳过，保持 A_norm 里的 0
                 if block.sum() == 0:
                     continue
-                
-                # 1. 阈值过滤
-                block_thresh = torch.where(block > sim_threshold, block, torch.zeros_like(block))
-                
-                # 2. 计算该块每行的最大值
-                block_max, _ = block_thresh.max(dim=1, keepdim=True)
-                
-                # 3. 归一化 (让该块最强关联变为 1.0)
-                block_norm = block_thresh / (block_max + 1e-12)
-                
-                # 4. 填回
-                A_norm[src_start:src_end, tgt_start:tgt_end] = block_norm
+                block = torch.where(block > sim_threshold, block, torch.zeros_like(block))
+                block_max, _ = block.max(dim=1, keepdim=True)
+                A_norm[src_start:src_end, tgt_start:tgt_end] = block / (block_max + 1e-12)
 
-        # ======================================================================
-        # 步骤 3: 调整对角线权重 (Self-loop)
-        # ======================================================================
-        
-        A_final = A_norm.to(A_raw.device)
-        dialog_indices = torch.eye(self.n_cls, dtype=torch.bool).to(A_raw.device)
-        
-        # 先清空对角线 (因为之前 block norm 可能会把对角线也变成 1)
-        A_final[dialog_indices] = 0.0 
-        
-        # 缩放邻居权重
-        A_final = A_final * (1.0 - s_reweight) 
-        
-        # 填回固定的自身权重
-        A_final[dialog_indices] = s_reweight
-        
+        # self-loop
+        A_final = A_norm
+        diag = torch.eye(self.n_cls, dtype=torch.bool, device=A_raw.device)
+        A_final[diag] = 0.0
+        A_final = A_final * (1.0 - s_reweight)
+        A_final[diag] = s_reweight
+
         self.register_buffer("A_star", A_final)
 
     def forward(self):
         return self.A_star
+
+
 class SemanticAssociationModule(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
-        num_layers = getattr(cfg, 'gcn_layers', 3)
-        mid_features = in_features * 2 
-        
-        gcn_layers = nn.ModuleList()
-        # Input Layer
-        gcn_layers.append(GraphConvolution(in_features, mid_features))
-        # Hidden Layers
+        num_layers = getattr(cfg, "gcn_layers", 3)
+        mid_features = in_features * 2
+
+        layers = nn.ModuleList()
+        layers.append(GraphConvolution(in_features, mid_features))
         for _ in range(num_layers - 2):
-            gcn_layers.append(GraphConvolution(mid_features, mid_features))
-        # Output Layer
-        gcn_layers.append(GraphConvolution(mid_features, out_features))
-            
-        self.gcn_layers = gcn_layers
+            layers.append(GraphConvolution(mid_features, mid_features))
+        layers.append(GraphConvolution(mid_features, out_features))
+
+        self.gcn_layers = layers
         self.relu = nn.LeakyReLU(0.2)
-        
+
     def forward(self, H0, A_star):
         H_l = H0.float()
-        
         for i, layer in enumerate(self.gcn_layers):
-            # 确保邻接矩阵和特征在同一设备
             A_star = A_star.to(H_l.device)
             H_l = layer(H_l, A_star)
             if i < len(self.gcn_layers) - 1:
-                H_l = self.relu(H_l) 
-                
-        # 残差连接 (Residual Connection)
-        Z_star = H0 + H_l
-        return Z_star
+                H_l = self.relu(H_l)
+        return H0 + H_l
 
-# ==============================================================================
-# 4. [最终模型] MMLSurgAdaptSCPNet
-# ==============================================================================
 
-    
+def get_topk_related_labels(pred_idx: int, logits_row: torch.Tensor, A_star: torch.Tensor):
+    """
+    score = sigmoid(logits_row) * A_star[pred_idx]
+    In the other two big groups, each take top-k.
+    """
+    k = _cfg("SCP_TOPK_K", 1)
+    use_sigmoid = _cfg("SCP_TOPK_USE_SIGMOID", True)
+
+    n_cls = A_star.shape[0]
+    phase_range = slice(0, 7)
+    view_range = slice(7, 10)
+    action_range = slice(10, n_cls)
+
+    def in_range(i, r):
+        return r.start <= i < r.stop
+
+    if in_range(pred_idx, phase_range):
+        targets = [view_range, action_range]
+    elif in_range(pred_idx, view_range):
+        targets = [phase_range, action_range]
+    elif in_range(pred_idx, action_range):
+        targets = [phase_range, view_range]
+    else:
+        raise ValueError("pred_idx not in any group range")
+
+    conf = torch.sigmoid(logits_row) if use_sigmoid else F.softmax(logits_row, dim=-1)
+    prior = A_star[pred_idx].to(logits_row.device)
+    joint = conf * prior
+
+    results = []
+    for r in targets:
+        scores = joint[r]
+        kk = min(k, scores.numel())
+        _, rel_idx = torch.topk(scores, kk)
+        results.append((rel_idx + r.start).tolist())
+    return results
+
+
+def compensate_logits_by_pred_prob(logits: torch.Tensor, pred_idx: torch.Tensor, topk_related_labels: list):
+    alpha = _cfg("SCP_COMP_ALPHA", 2.0)
+    temp = _cfg("SCP_COMP_TEMP", 1.0)
+
+    logits_comp = logits.clone()
+    probs = F.softmax(logits_comp / temp, dim=-1)
+
+    B = logits_comp.shape[0]
+    for b in range(B):
+        p = probs[b, int(pred_idx[b].item())]
+        delta = alpha * p
+        for group_topk in topk_related_labels[b]:
+            for idx in group_topk:
+                logits_comp[b, idx] += delta
+    return logits_comp
+
+
+def build_ignore_neg_mask_from_topk(topk_related_labels: list, n_cls: int, device):
+    B = len(topk_related_labels)
+    mask = torch.zeros((B, n_cls), dtype=torch.bool, device=device)
+    for b in range(B):
+        for group_topk in topk_related_labels[b]:
+            for idx in group_topk:
+                if 0 <= idx < n_cls:
+                    mask[b, idx] = True
+    return mask
+
+
 class MMLSurgAdaptSCPNet(nn.Module):
-
     def __init__(self, classnames, clip_model):
         super().__init__()
-        # CLIP 组件
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-        # Prompt Learner (可学习 prompt)
         self.prompt_learner = PromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
 
-        # --- 使用 SCPNet 的 SPP + SAM（与 consistency 版本一致） ---
-        # Structured Prior Prompter（构建并缓存 A_star）
         self.spp = StructuredPriorPrompter(classnames, clip_model)
-        # 缓存 A_star，但非一致性版本不会额外使用 augmentor 或返回 A_star
         self.register_buffer("A_star", self.spp())
 
-        # 获取特征维度（兼容多种 clip_model）
         try:
             feat_dim = clip_model.text_projection.shape[1]
         except Exception:
             feat_dim = 1024
 
-        # Semantic Association Module (GCN)
         self.sam = SemanticAssociationModule(feat_dim, feat_dim)
 
-        # 注意：**不**创建 BatchAugmentation 或一致性相关组件
-
     def encode_image(self, image, visual_adapter_func=None):
-
         if visual_adapter_func is not None:
-            image_features = self.image_encoder([image.type(self.dtype), visual_adapter_func])
-        else:
-            image_features = self.image_encoder(image.type(self.dtype))
-        return image_features
+            return self.image_encoder([image.type(self.dtype), visual_adapter_func])
+        return self.image_encoder(image.type(self.dtype))
 
     def forward(self, image, text_features=None):
-        """
-        返回 logits（用于主监督 loss）。
-        不返回 A_star，也不执行任何额外的一致性计算。
-        """
-        # 1) 图像编码
-        image_input = image
-        image_features = self.encode_image(image_input)
+        image_features = self.encode_image(image)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        # 2) 文本 Prompt ... (保持不变)
         child_prompts = self.prompt_learner()
         Z = self.text_encoder(child_prompts, self.tokenized_prompts)
 
-        # ======================================================================
-        # [防爆处理] GCN 专用归一化
-        # ======================================================================
-        # self.A_star 是我们要传给 Loss 的那个"数值大"的矩阵 (Max Norm)
-        # 但 GCN 不能吃这个，必须吃"行和为1"的矩阵 (Row-Sum Norm)
-        
-        # 计算行和
+        # GCN needs row-sum normalized adjacency
         row_sum = self.A_star.sum(dim=1, keepdim=True)
-        # 临时归一化 (不会修改 self.A_star 本身)
         A_gcn = self.A_star / (row_sum + 1e-12)
-        
-        # 3) 使用 SAM（GCN）
-        # [关键] 传 A_gcn 进去，保证数值稳定
-        text_features_refined = self.sam(Z, A_gcn) 
-        
+
+        text_features_refined = self.sam(Z, A_gcn)
         text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
 
-        # 4) 计算 logits
-        logits = 10 * image_features @ text_features_refined.t()
+        logits = 10.0 * image_features @ text_features_refined.t()
 
-        return logits
+        # build topk + ignore mask + compensate
+        pred_idx = logits.argmax(dim=-1)
+        topk_related_labels = []
+        for b in range(pred_idx.shape[0]):
+            topk_related_labels.append(
+                get_topk_related_labels(int(pred_idx[b].item()), logits[b], self.A_star)
+            )
+
+        ignore_neg_mask = build_ignore_neg_mask_from_topk(
+            topk_related_labels, n_cls=logits.shape[1], device=logits.device
+        )
+
+        logits = compensate_logits_by_pred_prob(logits, pred_idx, topk_related_labels)
+        return logits, ignore_neg_mask

@@ -266,7 +266,36 @@ class Hill(nn.Module):
         loss *= focal_weight
 
         return loss.sum(), targets
-    
+class Hill_Ignore(nn.Module):
+    def __init__(self, lamb: float = 1.5, margin: float = 1.0, gamma: float = 2.0, reduction: str = 'sum') -> None:
+        super(Hill_Ignore, self).__init__()
+        self.lamb = lamb
+        self.margin = margin
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets, epoch, ignore_neg_mask=None):
+        # logits: (N,C), targets: (N,C) 0/1
+
+        logits_margin = logits - self.margin
+        pred_pos = torch.sigmoid(logits_margin)
+        pred_neg = torch.sigmoid(logits)
+
+        pt = (1 - pred_pos) * targets + (1 - targets)
+        focal_weight = pt ** self.gamma
+
+        los_pos = targets * torch.log(pred_pos.clamp_min(1e-12))
+        los_neg = (1 - targets) * -(self.lamb - pred_neg) * pred_neg ** 2
+
+        # ====== 方案 B：只忽略负项（targets==0 才生效）======
+        if ignore_neg_mask is not None:
+            neg_ignore = ignore_neg_mask & (targets == 0)
+            los_neg = los_neg.masked_fill(neg_ignore, 0.0)
+
+        loss = -(los_pos + los_neg)
+        loss = loss * focal_weight
+
+        return loss.sum(), targets
 class AsymmetricLossOptimized(nn.Module):
     ''' Notice - optimized version, minimizes memory allocation and gpu uploading,
     favors inplace operations'''

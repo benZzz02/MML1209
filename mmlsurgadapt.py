@@ -15,8 +15,7 @@ from config import cfg
 # [关键修改] 清理并导入所有需要的模型
 from model import (
     load_clip_model, MMLSurgAdapt, Resnet, ViT, CrossModel, CLIP_for_train, VLPL, HSPNet,
-    MMLSurgAdaptCoOp, MMLSurgAdaptDualCoOp, MMLSurgAdaptCoCoOp,
-    MMLSurgAdaptCoOpFrozen, MMLSurgAdaptDualCoOpFrozen, MMLSurgAdaptCoCoOpFrozen, CLIP_TextAttention,CLIP_TextAttentionCoOp,CLIPCoOpLoRA,MMLSurgAdaptSCPNet
+    MMLSurgAdaptSCPNet
 )
 from surgvlp import SurgAVLP, CBertViT
 from consistency import ConsistencyAugmentor
