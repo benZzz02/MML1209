@@ -1,0 +1,97 @@
+# ==============================================================================
+# Training Basics
+# ==============================================================================
+n_ctx: 4
+model: SCPNet_PlusPlus
+model_name: scpnet
+backbone: ViT-L/14
+
+# 路径配置
+checkpoint: cholec_vals/scpnet_plus_plus_baseline_nofancy
+log_file: scpnet_plus_plus_baseline_nofancy.txt
+dir: trial_scpnet_plus_plus_baseline_nofancy
+
+# 优化器参数
+batch_size: 16
+accumulation_steps: 2
+lr: 3e-5
+epochs: 16
+change_epoch: 1
+init_epochs: 5
+init_lr: 1e-5
+seed: 0
+
+# ==============================================================================
+# Loss Function Strategy
+# ==============================================================================
+loss: Hill
+
+# ==============================================================================
+# [Innovation 1] Structure-Aware Prior (GCN & SPP Advanced)  —— 全关
+# ==============================================================================
+gcn_layers: 0                 # 关 GCN
+reweight_p: 0.0               # 不重权
+top_k: 1                      # 不做 topk 图
+sim_threshold: 99.0            # 让相似边基本不生效
+t_smooth: 1.0                 # 平滑/温度置无效化
+sglc_alpha: 0.0               # 关 SGLC 补偿
+external_adj_path: matrix.npy       # 不加载外部邻接
+
+# SGLC++ 细粒度参数 —— 全关/置无效
+use_head_source_only: False
+enable_missing_topk: False
+missing_topk: 0
+beta_missing: 0.0
+missing_score_mode: prior_x_support
+detach_probs: False
+head_mask_path: null
+tail_mask_path: null
+
+# ==============================================================================
+# [Innovation 2] Consistency Regularization —— 全关
+# ==============================================================================
+use_consistency: False
+w_cons: 0.0
+cons_flip_prob: 0.0
+cons_brightness_range: 0.0
+cons_brightness_min: 0.0
+cons_gray_prob: 0.0
+
+# ==============================================================================
+# Ignore Mask（PlusPlus 新增） —— 全关
+# ==============================================================================
+use_ignore: False
+ignore_topk: 0
+ignore_warmup: 999999
+ignore_prior_th: 1.0
+ignore_score_mode: prior_x_pred
+
+# ==============================================================================
+# Dataset & Labels
+# ==============================================================================
+num_classes: 110
+child_num: 110
+child_n_ctx: 4
+child_ctx_init: a photo
+relation_file: cholec/word2vec_similarity_matrix.npy
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+label_file: label_jsons/data1.json
+
+val_sp: True
+val_methods: ['pp_map', 'pp_loss', 'sp_loss']
+perform_init: False
+init_train_file: triplet_train_labels.json
+init_val_file: triplet_val_labels.json
+ratio: 1
+image_size: 224
+use_lfile: False
+getitem: False
+partial: False
+
+# ==============================================================================
+# Testing
+# ==============================================================================
+ckpt: temp.ckpt
+test_dir: trial_test_scpnet_plus_plus_baseline_nofancy
+test_loss: Hill
