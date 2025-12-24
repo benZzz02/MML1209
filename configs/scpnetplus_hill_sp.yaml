@@ -2,7 +2,7 @@
 # Training Basics
 # ==============================================================================
 n_ctx: 4
-model: SCPNet_Plus                  # [关键修改] 指定使用集成创新点的新模型类
+model: SCPNet                  # [关键修改] 指定使用集成创新点的新模型类
 model_name: scpnet                  # 内部标识，保持 scpnet 即可
 backbone : ViT-L/14                 # 建议使用 ViT 以支持 Patch 特征 (创新点 TGMI 需要)
 

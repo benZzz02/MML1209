@@ -266,6 +266,94 @@ class Hill(nn.Module):
         loss *= focal_weight
 
         return loss.sum(), targets
+
+
+class Hill_IgnoreFN(nn.Module):
+    """
+    Hill loss 包装版：支持缺失大类的 logits 补偿与候选假阴性 ignore。
+    forward(logits, targets, epoch, A_star=None) -> (loss, targets)
+    """
+
+    def __init__(
+        self,
+        lamb: float = 1.5,
+        margin: float = 1.0,
+        gamma: float = 2.0,
+        top_m: int = None,
+        comp_beta: float = None,
+        big_groups=None,
+    ) -> None:
+        super().__init__()
+        self.lamb = lamb
+        self.margin = margin
+        self.gamma = gamma
+        self.top_m = top_m if top_m is not None else getattr(cfg, "top_m", 5)
+        self.comp_beta = comp_beta if comp_beta is not None else getattr(cfg, "comp_beta", 0.5)
+        self.big_groups = big_groups or [(0, 7), (7, 10), (10, cfg.num_classes)]
+
+    def _build_rule_A(self, num_classes: int, device, dtype):
+        A = torch.ones(num_classes, num_classes, device=device, dtype=dtype)
+        for l, r in self.big_groups:
+            l = max(0, l)
+            r = min(num_classes, r)
+            if l >= r:
+                continue
+            A[l:r, l:r] = -1.0
+        A.fill_diagonal_(0.0)
+        row_sum = A.abs().sum(dim=1, keepdim=True)
+        return A / (row_sum + 1e-12)
+
+    def forward(self, logits, targets, epoch, A_star=None):
+        logits = logits.clone()
+        targets = targets.float()
+        device = logits.device
+        dtype = logits.dtype
+
+        num_classes = logits.shape[1]
+        relation = A_star
+        if relation is None:
+            relation = self._build_rule_A(num_classes, device, dtype)
+
+        ignore_mask = torch.zeros_like(logits, device=device, dtype=dtype)
+        comp_full = torch.matmul(targets, relation)
+
+        for (l, r) in self.big_groups:
+            l = max(0, l)
+            r = min(num_classes, r)
+            if l >= r:
+                continue
+
+            missing = (targets[:, l:r].sum(dim=1) == 0)
+            if missing.any():
+                comp_group = comp_full[missing][:, l:r]
+                logits[missing, l:r] = logits[missing, l:r] + self.comp_beta * comp_group
+
+                missing_indices = torch.nonzero(missing, as_tuple=False).squeeze(1)
+                for b in missing_indices:
+                    group_targets = targets[b, l:r]
+                    group_logits = logits[b, l:r]
+                    neg_indices = torch.nonzero(group_targets == 0, as_tuple=False).squeeze(1)
+                    if neg_indices.numel() == 0:
+                        continue
+                    k = min(self.top_m, neg_indices.numel())
+                    topk = torch.topk(group_logits[neg_indices], k=k, largest=True).indices
+                    chosen = neg_indices[topk]
+                    ignore_mask[b, l + chosen] = 1.0
+
+        logits_margin = logits - self.margin
+        pred_pos = torch.sigmoid(logits_margin)
+        pred_neg = torch.sigmoid(logits)
+
+        focal_weight = ((1 - pred_pos) * targets + (1 - targets)) ** self.gamma
+
+        los_pos = targets * torch.log(pred_pos + 1e-12)
+        los_neg = (1 - targets) * -(self.lamb - pred_neg) * pred_neg ** 2
+        los_neg = los_neg * (1 - ignore_mask)
+
+        loss = -(los_pos + los_neg)
+        loss *= focal_weight
+
+        return loss.sum(), targets
     
 class AsymmetricLossOptimized(nn.Module):
     ''' Notice - optimized version, minimizes memory allocation and gpu uploading,

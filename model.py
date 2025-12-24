@@ -1,5 +1,6 @@
 from collections import OrderedDict
 
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -1654,299 +1655,77 @@ class MMLSurgAdaptSCPNet(nn.Module):
         else:
              return logits
 
-class TextGuidedMultiGranularityInteraction(nn.Module):
-    def __init__(self, embed_dim, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
-        self.norm = nn.LayerNorm(embed_dim)
-        # 初始为0，让模型在训练初期先依赖全局特征，慢慢引入局部细节
-        self.gate = nn.Parameter(torch.tensor(0.0)) 
+class MMLSurgAdaptSCPNet_Relation(MMLSurgAdaptSCPNet):
+    """
+    新版 SCPNet：返回 (logits, A_star, loss_cons_internal)，并基于标签关系矩阵提供额外信息。
+    """
 
-    def forward(self, image_spatial_feats, text_feats):
-        """
-        Input:
-            image_spatial_feats: (B, N_patches, D) - 图像局部特征
-            text_feats: (B, N_cls, D) - GCN处理后的文本特征
-        Output:
-            Refined Text Features: (B, N_cls, D)
-        """
-        # Query=Text, Key/Value=Image Patches
-        # 意图：每个文本标签去图像里“搜寻”属于它的细节
-        attn_output, _ = self.cross_attn(
-            query=text_feats,
-            key=image_spatial_feats,
-            value=image_spatial_feats
-        )
-        # 残差连接：原始语义 + 视觉细节修正
-        return self.norm(text_feats + self.gate * attn_output)
+    def __init__(
+        self,
+        classnames,
+        clip_model,
+        big_groups=None,
+        cooccur_path: str = None,
+        rule_weight: float = 1.0,
+        cooccur_weight: float = 0.0,
+    ):
+        # 初始化基础组件
+        super().__init__(classnames, clip_model)
 
-# ==============================================================================
-# [创新点模块 B] Structure-Guided Logit Compensation (SGLC)
-# ==============================================================================
-class StructureGuidedLogitCompensation(nn.Module):
-    def __init__(self, num_classes=110, alpha=0.3):
-        super().__init__()
-            # ================= [Debug 插入点] =================
-        print(f"[DEBUG CHECK] SGLC Module Initialized!")
-        print(f" >> SGLC received alpha: {alpha}")
-        # ==================================================
-        self.alpha = alpha
-        # 假设前10个是Head(Phase/View)，后100个是Tail(Action)
-        # 只有 Tail 类才有资格获得补偿
-        mask = torch.zeros(num_classes)
-        mask[10:] = 1.0 
-        self.register_buffer('tail_mask', mask)
-        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.big_groups = big_groups or [(0, 7), (7, 10), (10, cfg.num_classes)]
+        self.rule_weight = rule_weight
+        self.cooccur_weight = cooccur_weight
+        self.cooccur_path = cooccur_path
 
-    def forward(self, logits, A_star):
-        # 1. 计算支持分 (利用 Head 类的高置信度)
-        # Prob(Phase) * Relation(Phase->Action)
-        probs = torch.sigmoid(logits).detach() 
-        support_score = torch.matmul(probs, A_star)
-        
-        # 2. 仅补偿 Tail 类
-        compensation = support_score * self.tail_mask
-        
-        # 3. 融合: Logits + alpha * Compensation
-        return logits + self.alpha * self.scale * compensation
+        A_star = self._build_relation_matrix(cfg.num_classes, clip_model.dtype)
+        self.register_buffer("A_star", A_star)
 
-# ==============================================================================
-# [专用组件] 高级结构化提示器 (为新模型专用，不影响旧模型)
-# 包含：互斥Mask + Min-Max归一化 (配合 SGLC 效果最好)
-# ==============================================================================
-class StructuredPriorPrompter_Advanced(nn.Module):
-    # [关键修改] 这里必须接收 threshold 和 top_k 参数，否则主类传参会报错
-    def __init__(self, classnames, clip_model, threshold=0.05, top_k=30):
-        super().__init__()
-        # ================= [Debug 插入点] =================
-        print(f"[DEBUG CHECK] SPP Module Initialized!")
-        print(f" >> SPP received threshold: {threshold}")
-        print(f" >> SPP received top_k: {top_k}")
-    # ==================================================
-        self.n_cls = len(classnames)
-        self.top_k = top_k          # 使用传入的参数
-        self.threshold = threshold  # 使用传入的参数
-        self.dtype = clip_model.dtype
-        self.logit_scale = clip_model.logit_scale
-        
-        # 1. 计算静态特征
-        template = "a photo of a {}."
-        classnames_proc = [name.replace("_", " ") for name in classnames]
-        prompts = [template.format(name) for name in classnames_proc]
-        
-        # Tokenize & Encode
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(self.logit_scale.device)
-        with torch.no_grad():
-             z_static = clip_model.encode_text(tokenized_prompts).type(self.dtype)
-        
-        z_static = F.normalize(z_static, p=2, dim=-1)
-        # 计算相似度矩阵
-        A_raw = torch.matmul(z_static, z_static.t())
-        
-        # 2. 强制互斥 Mask (根据你的数据集结构，假设前7个是Phase，后面是Action)
-        # 如果你的数据集不是 7+100 的结构，请根据实际情况修改切片
-        structure_mask = torch.ones_like(A_raw, dtype=torch.bool)
-        
-        # 假设前10个是Phase/View，强制内部无连接
-        # 如果 num_classes=110, 这里的硬编码可能需要根据你的 dataset 修改
-        # 为了通用性，这里只保留对角线
-        structure_mask.fill_diagonal_(True)
-        
-        A_masked = A_raw * structure_mask.float()
-        
-        # 3. Min-Max 归一化 & 阈值过滤
-        A_cpu = A_masked.float().cpu() # 放到 CPU 计算 TopK 以防显存不足
-        
-        # Top-K 过滤
-        values, indices = torch.topk(A_cpu, self.top_k, dim=1)
-        topk_mask = torch.zeros_like(A_cpu, dtype=torch.bool).scatter_(1, indices, True)
-        A_sparse = A_cpu.masked_fill(~topk_mask, 0.0).to(A_raw.device)
-        
-        # 阈值过滤
-        A_thresh = torch.where(A_sparse > self.threshold, A_sparse, torch.zeros_like(A_sparse))
-        
-        # 拉伸到 0-1
-        row_max = values[:, 0:1].to(A_raw.device)
-        row_min = values[:, -1:].to(A_raw.device)
-        # 防止除零
-        denominator = row_max - row_min + 1e-8
-        A_scaled = (A_thresh - row_min) / denominator
-        
-        # 再次应用 mask 确保稀疏性
-        A_scaled = A_scaled.masked_fill(~topk_mask.to(A_raw.device), 0.0)
-        A_scaled = F.relu(A_scaled)
+    def _build_relation_matrix(self, num_classes: int, dtype):
+        device = self.logit_scale.device
+        A_rule = torch.ones(num_classes, num_classes, device=device, dtype=dtype)
+        for l, r in self.big_groups:
+            l = max(0, l)
+            r = min(num_classes, r)
+            if l >= r:
+                continue
+            A_rule[l:r, l:r] = -1.0
+        A_rule.fill_diagonal_(0.0)
 
-        # L1 Norm (归一化到概率分布)
-        row_sum = A_scaled.sum(dim=1, keepdim=True)
-        A_star_normalized = A_scaled / (row_sum + 1e-12)
-        
-        # 4. Self-loop 加权 (给自身加点权重)
-        s_reweight = 0.2  # 自循环权重，可以写死或做成参数
-        A_final = A_star_normalized
-        
-        # 设置对角线
-        dialog_indices = torch.eye(self.n_cls, dtype=torch.bool).to(A_raw.device)
-        A_final[dialog_indices] = 0.0 
-        A_final = A_final * (1.0 - s_reweight) 
-        A_final[dialog_indices] = s_reweight
-        
-        self.register_buffer("A_star", A_final)
+        A_co = torch.zeros_like(A_rule)
+        if self.cooccur_path is not None and os.path.isfile(self.cooccur_path):
+            try:
+                co_np = np.load(self.cooccur_path)
+                co_tensor = torch.tensor(co_np, device=device, dtype=dtype)
+                co_tensor = co_tensor[:num_classes, :num_classes]
+                co_tensor.fill_diagonal_(0.0)
+                co_min = torch.min(co_tensor)
+                co_max = torch.max(co_tensor)
+                co_norm = (co_tensor - co_min) / (co_max - co_min + 1e-12)
+                A_co = co_norm
+            except Exception as e:
+                logger.warning(f"Failed to load co-occurrence matrix: {e}")
 
-    def forward(self):
-        return self.A_star
+        A = self.rule_weight * A_rule + self.cooccur_weight * A_co
+        A = torch.clamp(A, -1.0, 1.0)
+        A.fill_diagonal_(0.0)
 
-# ==============================================================================
-# [全功能新模型] MMLSurgAdaptSCPNet_Plus
-# 集成：GCN + TGMI (小目标) + SGLC (长尾) + Consistency (鲁棒性)
-# ==============================================================================
-class MMLSurgAdaptSCPNet_Plus(nn.Module):
-    def __init__(self, classnames, clip_model, alpha=0.1, sim_threshold=0.25, top_k=10):
-        super().__init__()
-        
-        # --- 1. 基础组件 (复用原有逻辑) ---
-        self.prompt_learner = PromptLearner(classnames, clip_model)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
-        self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
-        
-        try:
-            feat_dim = clip_model.text_projection.shape[1]
-        except:
-            feat_dim = 1024
-
-        # --- 2. GCN 部分 (使用高级版 A*) ---
-        # [修改] 这里传入 top_k 和 sim_threshold，确保 A* 矩阵的稀疏度和质量可控
-        self.spp = StructuredPriorPrompter_Advanced(
-            classnames, 
-            clip_model, 
-            threshold=sim_threshold, 
-            top_k=top_k
-        )
-        self.register_buffer("A_star", self.spp()) 
-        
-        # 复用 SemanticAssociationModule (GCN)
-        self.sam = SemanticAssociationModule(feat_dim, feat_dim)
-        
-        # --- 3. [创新点 1] TGMI (解决小目标看不清) ---
-        self.tgmi = TextGuidedMultiGranularityInteraction(feat_dim)
-        
-        # --- 4. [创新点 2] SGLC (解决长尾漏检) ---
-        # [修改] 传入 alpha 参数，允许通过 config 调节补偿强度
-        self.sglc = StructureGuidedLogitCompensation(
-            num_classes=len(classnames), 
-            alpha=alpha
-        )
-        
-        # --- 5. [创新点 3] 一致性 Loss (解决鲁棒性) ---
-        self.consistency_criterion = nn.MSELoss()
-
-    def encode_image_with_spatial(self, image):
-        """
-        专用编码器：提取 ViT 的 Global 和 Patch 特征
-        """
-        # 1. Patch Embedding
-        x = self.image_encoder.conv1(image.type(self.dtype)) 
-        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
-        
-        # 2. Add Class Token & Positional Embedding
-        # [安全修复] 确保 device 和 dtype 一致
-        cls_token = self.image_encoder.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
-        x = torch.cat([cls_token, x], dim=1)
-        # [安全修复] 类型转换
-        x = x + self.image_encoder.positional_embedding.to(x.dtype)
-        x = self.image_encoder.ln_pre(x)
-        
-        # 3. Transformer Forward
-        x = x.permute(1, 0, 2)
-        x = self.image_encoder.transformer(x)
-        x = x.permute(1, 0, 2)
-        
-        # 4. Split Global (CLS) and Spatial (Patches)
-        # x[:, 0, :] 是 CLS (Global), x[:, 1:, :] 是 Patches (Spatial)
-        global_feat = self.image_encoder.ln_post(x[:, 0, :])
-        
-        # 5. Projection (映射到文本空间)
-        if self.image_encoder.proj is not None:
-            global_feat = global_feat @ self.image_encoder.proj
-            # [关键修复] Patch 特征也必须投影，否则维度不匹配！
-            # 这里的 spatial_feats 形状: [B, 196, 1024] -> [B, 196, 768] (如果 proj 存在)
-            spatial_feats = x[:, 1:, :] @ self.image_encoder.proj
-        else:
-            spatial_feats = x[:, 1:, :]
-            
-        return global_feat, spatial_feats
+        row_sum = A.abs().sum(dim=1, keepdim=True)
+        A_norm = A / (row_sum + 1e-12)
+        return A_norm
 
     def forward(self, image, image_strong=None):
-        # ---------------------------------------------------------
-        # 1. 文本分支 (GCN 基石)
-        # ---------------------------------------------------------
-        # 这一步与图像无关，生成带有逻辑关系的文本特征
+        image_features = self.encode_image(image)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
         child_prompts = self.prompt_learner()
         Z = self.text_encoder(child_prompts, self.tokenized_prompts)
-        
-        # GCN 归一化处理 (Row-Sum)
+
         row_sum = self.A_star.sum(dim=1, keepdim=True)
         A_gcn = self.A_star / (row_sum + 1e-12)
-        
-        # 运行 GCN
-        text_features_gcn = self.sam(Z, A_gcn) 
-        
-        # ---------------------------------------------------------
-        # 2. 视觉分支 (Weak View) + TGMI
-        # ---------------------------------------------------------
-        # 提取 Global 和 Spatial 特征
-        img_global, img_spatial = self.encode_image_with_spatial(image)
-        img_global = img_global / img_global.norm(dim=-1, keepdim=True)
-        img_spatial = img_spatial / img_spatial.norm(dim=-1, keepdim=True)
-        
-        # 扩展文本特征以匹配 Batch Size
-        B = image.shape[0]
-        text_features_batch = text_features_gcn.unsqueeze(0).expand(B, -1, -1)
-        
-        # [创新点 1] TGMI: 让文本去"看"图像细节
-        text_features_refined = self.tgmi(img_spatial, text_features_batch)
+        text_features_refined = self.sam(Z, A_gcn)
         text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
-        
-        # 计算 原始 Logits (Weak / Teacher)
-        logits_weak = 10 * torch.einsum('bd, bnd -> bn', img_global, text_features_refined)
 
-        # ---------------------------------------------------------
-        # 3. [创新点 2] SGLC (Logit 补偿)
-        # ---------------------------------------------------------
-        # 利用 Phase 的高分补偿 Action，修正长尾漏检
-        # 这一步生成最终用于分类 Loss 的 Logits
-        logits_final = self.sglc(logits_weak, self.A_star)
+        logits = 10 * image_features @ text_features_refined.t()
+        loss_cons = torch.tensor(0.0, device=image.device, dtype=logits.dtype)
 
-        # ---------------------------------------------------------
-        # 4. [创新点 3] Consistency Loss (强弱一致性)
-        # ---------------------------------------------------------
-        loss_cons = torch.tensor(0.0).to(image.device)
-        
-        # 只有在训练模式且提供了强增强图像时才计算
-        if self.training and image_strong is not None:
-            # 强增强分支 (Student)
-            # 注意：这里不能用 no_grad()，因为我们需要训练 Student 去逼近 Teacher
-            # Teacher (logits_weak) 会被 detach，但 Student (logits_strong) 需要梯度
-            
-            img_global_s, img_spatial_s = self.encode_image_with_spatial(image_strong)
-            img_global_s = img_global_s / img_global_s.norm(dim=-1, keepdim=True)
-            img_spatial_s = img_spatial_s / img_spatial_s.norm(dim=-1, keepdim=True)
-            
-            # 强增强图也要经过 TGMI
-            text_features_s = self.tgmi(img_spatial_s, text_features_batch)
-            text_features_s = text_features_s / text_features_s.norm(dim=-1, keepdim=True)
-            
-            # 计算 强增强 Logits (Student)
-            logits_strong = 10 * torch.einsum('bd, bnd -> bn', img_global_s, text_features_s)
-            
-            # 计算 MSE Loss：让 Strong (Student) 的结果去逼近 Weak (Teacher)
-            # Teacher 的结果 detach 掉，不传导梯度，只优化 Student 对恶劣环境的适应力
-            loss_cons = self.consistency_criterion(logits_strong, logits_weak.detach())
-
-        # 返回三个值：
-        # 1. logits_final: 用于主分类任务 (Hill Loss)
-        # 2. A_star: 用于 Loss 内部可能的调用或可视化
-        # 3. loss_cons: 一致性 Loss，在 Trainer 外部加权求和
-        return logits_final, self.A_star, loss_cons
+        return logits, self.A_star, loss_cons

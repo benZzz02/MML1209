@@ -27,7 +27,8 @@ from args import args
 from log import logger
 from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
-    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency
+    iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency,
+    Hill_IgnoreFN
 )
 from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure, TopKCheckpointManager
 from config import cfg
@@ -38,7 +39,7 @@ from model import (
     MMLSurgAdaptCoOp, MMLSurgAdaptDualCoOp, MMLSurgAdaptCoCoOp,
     MMLSurgAdaptCoOpFrozen, MMLSurgAdaptDualCoOpFrozen, MMLSurgAdaptCoCoOpFrozen, 
     CLIP_TextAttention, CLIP_TextAttentionCoOp, CLIPCoOpLoRA,
-    MMLSurgAdaptSCPNet, MMLSurgAdaptSCPNet_Plus 
+    MMLSurgAdaptSCPNet, MMLSurgAdaptSCPNet_Relation 
 )
 from surgvlp import SurgAVLP, CBertViT
 
@@ -373,22 +374,14 @@ class SCPNetTrainer():
         elif model_name == 'CLIP-TextAttention-CoOp': self.model = CLIP_TextAttentionCoOp(classnames, clip_model)
         elif model_name == 'CLIP-CoOp-LoRA': self.model = CLIPCoOpLoRA(classnames, clip_model)
         # [SCPNet]
-        elif model_name == 'SCPNet': self.model = MMLSurgAdaptSCPNet(classnames, clip_model)
-        elif model_name == 'SCPNet_Plus': 
-            print("-" * 50)
-            print(f"[DEBUG CHECK] Reading Config:")
-            print(f" >> Alpha (SGLC): {getattr(cfg, 'sglc_alpha', 'Not Found')}")
-            print(f" >> Threshold (SPP): {getattr(cfg, 'sim_threshold', 'Not Found')}")
-            print(f" >> Top-K (SPP): {getattr(cfg, 'top_k', 'Not Found')}")
-            print("-" * 50)
-            # ==================================================
-
-            self.model = MMLSurgAdaptSCPNet_Plus(
-                classnames, 
+        elif model_name == 'SCPNet': 
+            self.model = MMLSurgAdaptSCPNet_Relation(
+                classnames,
                 clip_model,
-                alpha=getattr(cfg, 'sglc_alpha', 0.1),         
-                sim_threshold=getattr(cfg, 'sim_threshold', 0.25), 
-                top_k=getattr(cfg, 'top_k', 10)               
+                big_groups=getattr(cfg, "big_groups", [(0, 7), (7, 10), (10, cfg.num_classes)]),
+                cooccur_path=getattr(cfg, "cooccur_path", None),
+                rule_weight=getattr(cfg, "rule_weight", 1.0),
+                cooccur_weight=getattr(cfg, "cooccur_weight", 0.0),
             )
         else:
             raise NameError(f"Model '{model_name}' not recognized.")
@@ -444,7 +437,7 @@ class SCPNetTrainer():
         else:
             with autocast():
                 # [适配] SCPNet 系列：支持 (image, strong) 输入和多返回值
-                if cfg.model in ['SCPNet', 'SCPNet_Plus', 'MMLSurgAdaptSCPNet_Plus']:
+                if cfg.model in ['SCPNet']:
                     output_tuple = self.model(image, image_strong)
                     
                     if isinstance(output_tuple, tuple):
@@ -511,6 +504,14 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
         ),
         'SPLC_Consistency': lambda: SPLC_Consistency(
             tau=getattr(cfg, 'tau', 0.6), change_epoch=getattr(cfg, 'change_epoch', 1), margin=getattr(cfg, 'margin', 1.0), gamma=getattr(cfg, 'gamma', 2.0), cons_weight=getattr(cfg, 'cons_weight', 20.0), cons_temp=getattr(cfg, 'cons_temp', 1.0)
+        ),
+        'Hill_IgnoreFN': lambda: Hill_IgnoreFN(
+            lamb=getattr(cfg, 'lamb', 1.5),
+            margin=getattr(cfg, 'margin', 1.0),
+            gamma=getattr(cfg, 'gamma', 2.0),
+            top_m=getattr(cfg, 'top_m', 5),
+            comp_beta=getattr(cfg, 'comp_beta', 0.5),
+            big_groups=getattr(cfg, "big_groups", [(0, 7), (7, 10), (10, cfg.num_classes)])
         ),
     }
     if criterion is None:
@@ -682,6 +683,14 @@ def train(trainer, dir) -> list:
         'SCE': lambda: SCELoss(alpha=1.0, beta=1.0),
         'Hill_Consistency': lambda: Hill_Consistency(lamb=getattr(cfg, 'lamb', 1.5), margin=getattr(cfg, 'margin', 1.0), gamma=getattr(cfg, 'gamma', 2.0), cons_weight=getattr(cfg, 'cons_weight', 20.0), cons_temp=getattr(cfg, 'cons_temp', 1.0)),
         'SPLC_Consistency': lambda: SPLC_Consistency(tau=getattr(cfg, 'tau', 0.6), change_epoch=getattr(cfg, 'change_epoch', 1), margin=getattr(cfg, 'margin', 1.0), gamma=getattr(cfg, 'gamma', 2.0), cons_weight=getattr(cfg, 'cons_weight', 20.0), cons_temp=getattr(cfg, 'cons_temp', 1.0)),
+        'Hill_IgnoreFN': lambda: Hill_IgnoreFN(
+            lamb=getattr(cfg, 'lamb', 1.5),
+            margin=getattr(cfg, 'margin', 1.0),
+            gamma=getattr(cfg, 'gamma', 2.0),
+            top_m=getattr(cfg, 'top_m', 5),
+            comp_beta=getattr(cfg, 'comp_beta', 0.5),
+            big_groups=getattr(cfg, "big_groups", [(0, 7), (7, 10), (10, cfg.num_classes)])
+        ),
     }
     criterion = loss_dict.get(cfg.loss, lambda: None)()
     if criterion is None: raise ValueError(f"Loss function '{cfg.loss}' not found.")
