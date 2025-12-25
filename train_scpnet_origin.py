@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.distributed as dist
 import os
@@ -396,12 +395,11 @@ class SCPNetTrainer():
 
         logger.info(f"Successfully initialized model: {model_name}")
         self.classnames = classnames
-
         if self.distributed:
-            # 将模型中所有的 nn.BatchNorm 转换为 nn.SyncBatchNorm（保证跨卡统计一致）
+            # 将模型中所有的 nn.BatchNorm 转换为 nn.SyncBatchNorm
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
             logger.info("已开启同步 BatchNorm (SyncBatchNorm)")
-
+# ----------------------------
         self.model.cuda(self.gpu_id)
         if self.distributed:
             self.model = DDP(self.model, device_ids=[self.gpu_id], output_device=self.gpu_id, find_unused_parameters=True)
@@ -717,23 +715,11 @@ def train(trainer, dir) -> list:
     
     parameters = add_weight_decay(trainer.model, cfg.weight_decay)
     optimizer = torch.optim.Adam(params=parameters, lr=cfg.lr, weight_decay=0)
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
+    scaler = GradScaler()
+    
     steps_per_epoch = len(trainer.train_loader)
     accumulation_steps = getattr(cfg, 'accumulation_steps', 1)
-    optimizer_steps_per_epoch = math.ceil(steps_per_epoch / accumulation_steps)
-    total_optimizer_steps = optimizer_steps_per_epoch * cfg.epochs
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_optimizer_steps, eta_min=1e-6
-    )
-    scaler = GradScaler()
-
-    if is_main_process():
-        effective_batch = cfg.batch_size * world_size * accumulation_steps
-        logger.info(
-            f"Effective batch size (global): {effective_batch} = batch_per_gpu({cfg.batch_size})"
-            f" x world_size({world_size}) x accumulation({accumulation_steps})"
-        )
 
     top_k_num = getattr(cfg, 'top_k', 3)
     best_map_list = []
@@ -840,7 +826,6 @@ def train(trainer, dir) -> list:
                 scaler.update()
                 optimizer.zero_grad()
                 trainer.ema.update(trainer.model)
-                scheduler.step()
             
             if i % 100 == 0 and is_main_process():
                 log_loss = loss.item() * accumulation_steps
@@ -901,6 +886,7 @@ def train(trainer, dir) -> list:
             if cfg.val_sp: best_sp_loss_list = best_sp_loss_list[:top_k_num]
 
         trainer.model.train()
+        scheduler.step()
 
     final_paths = []
     if is_main_process():
@@ -997,15 +983,8 @@ def main():
     if is_main_process():
         logger.info(f'Seed {s}, DDP: {is_distributed}, GPU: {gpu_id}')
     
-    # 关闭非确定性行为，确保不同卡数时的结果更可比
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-    # 默认关闭 TF32，保证数值路径一致；如需开启可在配置中添加 allow_tf32=True
-    allow_tf32 = getattr(cfg, "allow_tf32", False)
-    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-    torch.backends.cudnn.allow_tf32 = allow_tf32
+    torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.benchmark = True
     
     dir = cfg.dir
     makedir(dir)
