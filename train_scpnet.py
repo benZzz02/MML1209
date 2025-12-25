@@ -362,15 +362,7 @@ class SCPNetTrainer():
         elif model_name == 'ViT': self.model = ViT(classnames, clip_model)
         elif model_name == 'CLIP': self.model = CLIP_for_train(classnames, clip_model)
         elif model_name == 'CrossModel': self.model = CrossModel(classnames, clip_model)
-        elif model_name == 'SurgAdapt-CoOp': self.model = MMLSurgAdaptCoOp(classnames, clip_model)
-        elif model_name == 'SurgAdapt-DualCoOp': self.model = MMLSurgAdaptDualCoOp(classnames, clip_model)
-        elif model_name == 'SurgAdapt-CoCoOp': self.model = MMLSurgAdaptCoCoOp(classnames, clip_model)
-        elif model_name == 'SurgAdapt-CoOp-Frozen': self.model = MMLSurgAdaptCoOpFrozen(classnames, clip_model)
-        elif model_name == 'SurgAdapt-DualCoOp-Frozen': self.model = MMLSurgAdaptDualCoOpFrozen(classnames, clip_model)
-        elif model_name == 'SurgAdapt-CoCoOp-Frozen': self.model = MMLSurgAdaptCoCoOpFrozen(classnames, clip_model)
-        elif model_name == 'CLIP-TextAttention': self.model = CLIP_TextAttention(classnames, clip_model)
-        elif model_name == 'CLIP-TextAttention-CoOp': self.model = CLIP_TextAttentionCoOp(classnames, clip_model)
-        elif model_name == 'CLIP-CoOp-LoRA': self.model = CLIPCoOpLoRA(classnames, clip_model)
+
         # [SCPNet]
         elif model_name == 'SCPNet': self.model = MMLSurgAdaptSCPNet(classnames, clip_model)
         elif model_name == 'SCPNet_Plus': 
@@ -723,8 +715,20 @@ def train(trainer, dir) -> list:
     optimizer_steps_per_epoch = math.ceil(steps_per_epoch / accumulation_steps)
     total_optimizer_steps = optimizer_steps_per_epoch * cfg.epochs
 
+    mimic_single_card = getattr(cfg, "mimic_single_card", False)
+
+    # 支持 per_step / per_epoch 两种调度粒度；若开启 mimic_single_card，默认 per_step 以对齐单卡步数
+    scheduler_mode = getattr(
+        cfg,
+        "scheduler_granularity",
+        "per_step" if mimic_single_card else "per_epoch",
+    )
+    if scheduler_mode not in ["per_step", "per_epoch"]:
+        scheduler_mode = "per_epoch"
+
+    scheduler_T_max = total_optimizer_steps if scheduler_mode == "per_step" else cfg.epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_optimizer_steps, eta_min=1e-6
+        optimizer, T_max=scheduler_T_max, eta_min=1e-6
     )
     scaler = GradScaler()
 
@@ -735,11 +739,8 @@ def train(trainer, dir) -> list:
             f" x world_size({world_size}) x accumulation({accumulation_steps})"
         )
 
-    top_k_num = getattr(cfg, 'top_k', 3)
-    best_map_list = []
-    best_pp_loss_list = []
-    best_sp_loss_list = []
-    
+    # 保存每个 epoch 的 checkpoint，不再裁剪
+    saved_paths = []
     save_dir_base = os.path.join(cfg.checkpoint, dir)
     if is_main_process(): os.makedirs(save_dir_base, exist_ok=True)
 
@@ -840,7 +841,8 @@ def train(trainer, dir) -> list:
                 scaler.update()
                 optimizer.zero_grad()
                 trainer.ema.update(trainer.model)
-                scheduler.step()
+                if scheduler_mode == "per_step":
+                    scheduler.step()
             
             if i % 100 == 0 and is_main_process():
                 log_loss = loss.item() * accumulation_steps
@@ -864,51 +866,15 @@ def train(trainer, dir) -> list:
             filename = f"epoch_{epoch}_mAP_{cur_map:.2f}_loss_{cur_pp_loss:.4f}_{suffix}.ckpt"
             filepath = os.path.join(save_dir_base, filename)
             
-            save_needed = False
-            best_map_list.append((cur_map, epoch, filepath))
-            best_map_list.sort(key=lambda x: x[0], reverse=True)
-            if any(x[1] == epoch for x in best_map_list[:top_k_num]): save_needed = True
-
-            best_pp_loss_list.append((cur_pp_loss, epoch, filepath))
-            best_pp_loss_list.sort(key=lambda x: x[0])
-            if any(x[1] == epoch for x in best_pp_loss_list[:top_k_num]): save_needed = True
-                
-            if cfg.val_sp and 'sp_loss' in evals:
-                best_sp_loss_list.append((evals['sp_loss'], epoch, filepath))
-                best_sp_loss_list.sort(key=lambda x: x[0])
-                if any(x[1] == epoch for x in best_sp_loss_list[:top_k_num]): save_needed = True
-            
-            if save_needed:
-                torch.save(state_dict, filepath)
-                logger.info(f"Saved Top-K model: {filename}")
-
-            valid_paths = set()
-            valid_paths.update([x[2] for x in best_map_list[:top_k_num]])
-            valid_paths.update([x[2] for x in best_pp_loss_list[:top_k_num]])
-            if cfg.val_sp: valid_paths.update([x[2] for x in best_sp_loss_list[:top_k_num]])
-            
-            for f in os.listdir(save_dir_base):
-                if f.endswith('.ckpt') and "epoch_" in f:
-                    full_p = os.path.join(save_dir_base, f)
-                    if full_p not in valid_paths:
-                        try:
-                            os.remove(full_p)
-                            logger.info(f"Removed worse model: {f}")
-                        except: pass
-            
-            best_map_list = best_map_list[:top_k_num]
-            best_pp_loss_list = best_pp_loss_list[:top_k_num]
-            if cfg.val_sp: best_sp_loss_list = best_sp_loss_list[:top_k_num]
+            torch.save(state_dict, filepath)
+            saved_paths.append(filepath)
+            logger.info(f"Saved model for epoch {epoch}: {filename}")
 
         trainer.model.train()
+        if scheduler_mode == "per_epoch":
+            scheduler.step()
 
-    final_paths = []
-    if is_main_process():
-        if best_map_list: final_paths.extend([x[2] for x in best_map_list])
-        if best_pp_loss_list: final_paths.extend([x[2] for x in best_pp_loss_list])
-        if best_sp_loss_list: final_paths.extend([x[2] for x in best_sp_loss_list])
-        final_paths = list(set(final_paths))
-        
+    final_paths = saved_paths if is_main_process() else []
     return final_paths
 
 def test(trainer, dir, checkpoint_paths=None) -> None:
@@ -997,16 +963,41 @@ def main():
     if is_main_process():
         logger.info(f'Seed {s}, DDP: {is_distributed}, GPU: {gpu_id}')
     
-    # 关闭非确定性行为，确保不同卡数时的结果更可比
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    # 可配置的确定性与 TF32 行为；mimic_single_card 时默认开启确定性并关闭 TF32
+    mimic_single_card = getattr(cfg, "mimic_single_card", False)
+    strict_deterministic = getattr(cfg, "strict_deterministic", mimic_single_card)
+    allow_tf32 = getattr(cfg, "allow_tf32", not mimic_single_card)
 
-    # 默认关闭 TF32，保证数值路径一致；如需开启可在配置中添加 allow_tf32=True
-    allow_tf32 = getattr(cfg, "allow_tf32", False)
+    if strict_deterministic:
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    else:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
     torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     torch.backends.cudnn.allow_tf32 = allow_tf32
+
+    if is_main_process():
+        logger.info(
+            f"Deterministic={strict_deterministic}, TF32={allow_tf32}, "
+            f"Scheduler mode={getattr(cfg, 'scheduler_granularity', 'per_epoch')}"
+        )
     
+    # 若希望多卡模拟单卡全局 batch，按 target_global_batch 均分到每卡
+    target_global_batch = getattr(cfg, "target_global_batch", None)
+    world_size = dist.get_world_size() if is_distributed else 1
+    if target_global_batch is not None and world_size > 1:
+        per_gpu_batch = max(1, math.ceil(target_global_batch / world_size))
+        if is_main_process():
+            logger.info(
+                f"Use target_global_batch={target_global_batch}, "
+                f"world_size={world_size}, set batch_size per GPU -> {per_gpu_batch}"
+            )
+        cfg.batch_size = per_gpu_batch
+
     dir = cfg.dir
     makedir(dir)
     if is_distributed: dist.barrier()
