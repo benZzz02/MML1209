@@ -5,7 +5,7 @@ log_file: scpnet_hill_Ignore_sp.txt
 model_name: scpnet
 batch_size: 32
 accumulation_steps: 1
-lr: 1e-5
+lr: 3e-5
 epochs: 10
 reweight_p: 0.2
 relation_file: cholec/word2vec_similarity_matrix.npy
@@ -50,9 +50,20 @@ test_loss: Hill_Ignore  # Loss function
 gcn_layers: 3
 sim_threshold: 0.05
 SCP_TOPK_K: 1
-SCP_COMP_ALPHA: 2.0
-SCP_COMP_TEMP: 1.0
+SCP_COMP_ALPHA: 2.5
+SCP_COMP_TEMP: 0.7
 SCP_TOPK_USE_SIGMOID: True
 
 debug: True
 debug_step: 200
+
+
+
+
+target_global_batch: 128      # 目标全局 batch，用于多卡对齐单卡行为
+mimic_single_card: true       # 自动 per_step 调度 + 确定性/关 TF32
+scheduler_granularity: per_step
+
+# 确定性与 TF32
+strict_deterministic: true    # 走确定性 cudnn
+allow_tf32: false             # 关闭 TF32，保持数值路径一致
