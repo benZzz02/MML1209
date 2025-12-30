@@ -3,9 +3,9 @@ n_ctx: 4
 checkpoint: cholec_vals/scpnet_hill_Ignore_pp    # For saving checkpoints
 log_file: scpnet_hill_Ignore_pp.txt
 model_name: scpnet
-batch_size: 20
-accumulation_steps: 2
-lr: 1e-5
+batch_size: 32
+accumulation_steps: 1
+lr: 3e-5
 epochs: 10
 reweight_p: 0.2
 relation_file: cholec/word2vec_similarity_matrix.npy
@@ -47,12 +47,12 @@ ckpt: temp.ckpt  # Ckpt path for inference
 test_dir: trial_test_scpnet_hill_Ignore_pp # Directory to save results
 test_loss: Hill_Ignore  # Loss function
 
-gcn_layers: 3
+gcn_layers: 2
 sim_threshold: 0.05
 SCP_TOPK_K: 1
 SCP_COMP_ALPHA: 2.0
 SCP_COMP_TEMP: 1.0
-SCP_TOPK_USE_SIGMOID: True
+SCP_TOPK_USE_SIGMOID: False
 
 debug: True
 debug_step: 200
