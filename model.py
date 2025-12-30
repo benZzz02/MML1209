@@ -804,6 +804,46 @@ class StructuredPriorPrompter(nn.Module):
         A_final = A_final * (1.0 - s_reweight)
         A_final[diag] = s_reweight
 
+        external_path = getattr(cfg, "SCP_EXTERNAL_MATRIX_PATH", None)
+        external_weight = getattr(cfg, "SCP_EXTERNAL_MATRIX_WEIGHT", 0.5)
+
+        if external_path:
+            if os.path.isfile(external_path):
+                try:
+                    external_matrix = np.load(external_path, allow_pickle=False)
+                except Exception as e:
+                    logger.warning(
+                        f"SCP external matrix failed to load from {external_path}: {e}. Skipping merge."
+                    )
+                else:
+                    if isinstance(external_matrix, np.lib.npyio.NpzFile):
+                        logger.warning(
+                            f"SCP external matrix expected .npy but got .npz at {external_path}. Skipping merge."
+                        )
+                    else:
+                        external_tensor = torch.as_tensor(
+                            external_matrix, dtype=A_final.dtype, device=A_final.device
+                        )
+
+                        if external_tensor.shape == A_final.shape:
+                            weight = float(external_weight)
+                            weight = min(max(weight, 0.0), 1.0)
+                            A_final = (1.0 - weight) * A_final + weight * external_tensor
+                            logger.info(
+                                f"SCP external matrix loaded from {external_path} with weight {weight:.3f}"
+                            )
+                        else:
+                            logger.warning(
+                                "SCP external matrix shape mismatch: "
+                                f"expected {A_final.shape}, got {external_tensor.shape}. Skipping merge."
+                            )
+            else:
+                logger.warning(
+                    f"SCP external matrix path not found: {external_path}. Skipping merge."
+                )
+
+        
+        
         self.register_buffer("A_star", A_final)
 
     def forward(self):

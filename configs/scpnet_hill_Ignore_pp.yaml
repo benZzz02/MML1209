@@ -47,12 +47,14 @@ ckpt: temp.ckpt  # Ckpt path for inference
 test_dir: trial_test_scpnet_hill_Ignore_pp # Directory to save results
 test_loss: Hill_Ignore  # Loss function
 
-gcn_layers: 2
+gcn_layers: 3
 sim_threshold: 0.05
 SCP_TOPK_K: 1
 SCP_COMP_ALPHA: 2.0
 SCP_COMP_TEMP: 1.0
 SCP_TOPK_USE_SIGMOID: False
 
+SCP_EXTERNAL_MATRIX_PATH: matrix.npy
+SCP_EXTERNAL_MATRIX_WEIGHT: 0.5
 debug: True
 debug_step: 200
