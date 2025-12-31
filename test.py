@@ -15,10 +15,11 @@ import torch.distributed as dist # [DDP]
 from torch.cuda.amp import GradScaler, autocast  # type: ignore
 import torch.nn.functional
 from torch.optim import lr_scheduler
+from log import logger
 
 from loss import SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL
 from mmlsurgadapt import MMLSurgAdaptTrainer
-from utils import AverageMeter, add_weight_decay, mAP
+from utils import AverageMeter, add_weight_decay, mAP, compute_macro_micro_recall
 import warnings
 
 from config import cfg
@@ -327,11 +328,66 @@ def calculate_metrics(labels,preds,preds_ema,video_ids,test,dir):
         filtered_video_ids = video_ids[mask]
 
         if dataset == "cholec80":
+            phase_true_bool = filtered_labels.astype(bool)
+            phase_pred_idx = np.argmax(filtered_preds, axis=1)
+            phase_pred_bool = np.eye(phase_true_bool.shape[1])[phase_pred_idx].astype(bool)
+            phase_macro_recall, phase_micro_recall = compute_macro_micro_recall(phase_true_bool, phase_pred_bool)
+
+            if test:
+                phase_macro_recall_ema, phase_micro_recall_ema = None, None
+            else:
+                phase_pred_idx_ema = np.argmax(filtered_preds_ema, axis=1)
+                phase_pred_bool_ema = np.eye(phase_true_bool.shape[1])[phase_pred_idx_ema].astype(bool)
+                phase_macro_recall_ema, phase_micro_recall_ema = compute_macro_micro_recall(phase_true_bool, phase_pred_bool_ema)
+
             a = process_cholec80(filtered_labels,filtered_preds,filtered_preds_ema,filtered_video_ids,test)
+            phase_msg = f"[Eval][Phase] F1_reg={a[0]:.2f}"
+            if not test and a[1] is not None:
+                phase_msg += f" F1_EMA={a[1]:.2f}"
+            phase_msg += f" | Phase macroR_reg={phase_macro_recall:.2f} microR_reg={phase_micro_recall:.2f}"
+            if not test and phase_macro_recall_ema is not None:
+                phase_msg += f" | Phase macroR_EMA={phase_macro_recall_ema:.2f} microR_EMA={phase_micro_recall_ema:.2f}"
+            logger.info(phase_msg)
         if dataset == "endoscapes":
+            cvs_true_bool = filtered_labels.astype(bool)
+            cvs_pred_bool = (filtered_preds >= 0.5)
+            cvs_macro_recall, cvs_micro_recall = compute_macro_micro_recall(cvs_true_bool, cvs_pred_bool)
+
+            if test:
+                cvs_macro_recall_ema, cvs_micro_recall_ema = None, None
+            else:
+                cvs_pred_bool_ema = (filtered_preds_ema >= 0.5)
+                cvs_macro_recall_ema, cvs_micro_recall_ema = compute_macro_micro_recall(cvs_true_bool, cvs_pred_bool_ema)
+
             b = process_endo(filtered_labels,filtered_preds,filtered_preds_ema,filtered_video_ids,test)
+            cvs_msg = f"[Eval][CVS] mAP_reg={b[0]:.2f}"
+            if not test and b[1] is not None:
+                cvs_msg += f" mAP_EMA={b[1]:.2f}"
+            cvs_msg += f" | CVS macroR_reg={cvs_macro_recall:.2f} microR_reg={cvs_micro_recall:.2f}"
+            if not test and cvs_macro_recall_ema is not None:
+                cvs_msg += f" | CVS macroR_EMA={cvs_macro_recall_ema:.2f} microR_EMA={cvs_micro_recall_ema:.2f}"
+            logger.info(cvs_msg)
         if dataset == 'cholect50':
+            triplet_true_bool = filtered_labels.astype(bool)
+            triplet_pred_bool = (filtered_preds >= 0.5)
+            triplet_macro_recall, triplet_micro_recall = compute_macro_micro_recall(triplet_true_bool, triplet_pred_bool)
+
+            if test:
+                triplet_macro_recall_ema, triplet_micro_recall_ema = None, None
+            else:
+                triplet_pred_bool_ema = (filtered_preds_ema >= 0.5)
+                triplet_macro_recall_ema, triplet_micro_recall_ema = compute_macro_micro_recall(triplet_true_bool, triplet_pred_bool_ema)
+
             c = process_cholect50(filtered_labels,filtered_preds,filtered_preds_ema,filtered_video_ids,test)
+            ap_ivt = c[0].get("AP_ivt", 0.0) if c else 0.0
+            ap_ivt_ema = c[1].get("AP_ivt", None) if (not test and c and c[1]) else None
+            triplet_msg = f"[Eval][Triplet] AP_ivt_reg={ap_ivt:.2f}"
+            if not test and ap_ivt_ema is not None:
+                triplet_msg += f" AP_ivt_EMA={ap_ivt_ema:.2f}"
+            triplet_msg += f" | Triplet macroR_reg={triplet_macro_recall:.2f} microR_reg={triplet_micro_recall:.2f}"
+            if not test and triplet_macro_recall_ema is not None:
+                triplet_msg += f" | Triplet macroR_EMA={triplet_macro_recall_ema:.2f} microR_EMA={triplet_micro_recall_ema:.2f}"
+            logger.info(triplet_msg)
 
     if a and b and c:
         save_results(a,b,c,test,dir)

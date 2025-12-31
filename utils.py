@@ -53,6 +53,28 @@ def mAP(targs, preds):
     return 100 * ap.mean()
 
 
+def compute_macro_micro_recall(y_true, y_pred):
+    """
+    Compute macro and micro recall for multi-label predictions.
+    Args:
+        y_true: array-like of ground truth labels (0/1).
+        y_pred: array-like of predicted labels (0/1).
+    Returns:
+        macro_recall, micro_recall (both scaled to 0-100).
+    """
+    y_true_bool = np.asarray(y_true).astype(bool)
+    y_pred_bool = np.asarray(y_pred).astype(bool)
+
+    tp = np.logical_and(y_true_bool, y_pred_bool).sum(axis=0).astype(np.float64)
+    fn = np.logical_and(y_true_bool, np.logical_not(y_pred_bool)).sum(axis=0).astype(np.float64)
+
+    denom = tp + fn
+    valid = denom > 0
+    macro = (tp[valid] / (denom[valid] + 1e-12)).mean() if np.any(valid) else 0.0
+    micro = tp.sum() / (tp.sum() + fn.sum() + 1e-12)
+    return macro * 100.0, micro * 100.0
+
+
 class AverageMeter(object):
 
     def __init__(self):

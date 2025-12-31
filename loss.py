@@ -288,7 +288,7 @@ class Hill_Ignore(nn.Module):
         los_neg = (1 - targets) * -(self.lamb - pred_neg) * pred_neg ** 2
 
         # ====== 方案 B：只忽略负项（targets==0 才生效）======
-        if ignore_neg_mask is not None:
+        if getattr(cfg, "SCP_ENABLE_IGNORE", True) and ignore_neg_mask is not None:
             neg_ignore = ignore_neg_mask & (targets == 0)
             los_neg = los_neg.masked_fill(neg_ignore, 0.0)
 

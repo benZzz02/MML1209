@@ -981,19 +981,25 @@ class MMLSurgAdaptSCPNet(nn.Module):
         text_features_refined = self.sam(Z, A_gcn)
         text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
 
-        logits = 10.0 * image_features @ text_features_refined.t()
+        logits_base = 10.0 * image_features @ text_features_refined.t()
 
         # build topk + ignore mask + compensate
-        pred_idx = logits.argmax(dim=-1)
+        pred_idx = logits_base.argmax(dim=-1)
         topk_related_labels = []
         for b in range(pred_idx.shape[0]):
             topk_related_labels.append(
-                get_topk_related_labels(int(pred_idx[b].item()), logits[b], self.A_star)
+                get_topk_related_labels(int(pred_idx[b].item()), logits_base[b], self.A_star)
             )
 
-        ignore_neg_mask = build_ignore_neg_mask_from_topk(
-            topk_related_labels, n_cls=logits.shape[1], device=logits.device
-        )
+        if getattr(cfg, "SCP_ENABLE_IGNORE", True):
+            ignore_neg_mask = build_ignore_neg_mask_from_topk(
+                topk_related_labels, n_cls=logits_base.shape[1], device=logits_base.device
+            )
+        else:
+            ignore_neg_mask = None
 
-        logits = compensate_logits_by_pred_prob(logits, pred_idx, topk_related_labels)
-        return logits, ignore_neg_mask
+        if getattr(cfg, "SCP_ENABLE_COMPENSATE", True):
+            logits_out = compensate_logits_by_pred_prob(logits_base, pred_idx, topk_related_labels)
+        else:
+            logits_out = logits_base
+        return logits_out, ignore_neg_mask
