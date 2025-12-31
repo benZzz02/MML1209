@@ -30,7 +30,7 @@ from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
     iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency,Hill_Ignore
 )
-from utils import AverageMeter, add_weight_decay, mAP, compute_recall_at_k
+from utils import AverageMeter, add_weight_decay, mAP, compute_recall_at_k, get_task_class_indices
 from config import cfg
 from consistency import ConsistencyAugmentor
 
@@ -222,7 +222,33 @@ def process_cholect50(true, pred, pred_ema, video_ids, test):
 
     return aps, aps_ema
 
-def save_results(a, b, c, test, dir, method):
+def compute_task_recall(logits: torch.Tensor, targets: torch.Tensor, task_class_indices: Dict[str, List[int]], ks=(1, 3, 5, 10)):
+    results: Dict[str, Dict[int, Dict[str, float]]] = {}
+    for task, indices in task_class_indices.items():
+        if not indices:
+            logger.warning(f"No class indices found for task '{task}', skip Recall@K calculation.")
+            continue
+        results[task] = compute_recall_at_k(
+            logits,
+            targets,
+            ks=ks,
+            class_mask=indices
+        )
+    return results
+
+
+def log_recall_results(title: str, recall_results: Dict[str, Dict[int, Dict[str, float]]]):
+    if not recall_results:
+        return
+    logger.info(f"{title} Recall@K by task:")
+    for task, metrics in recall_results.items():
+        logger.info(f"[{task}] K\tRecall@K\tHit\tTotal_Pos")
+        for k in sorted(metrics.keys()):
+            res = metrics[k]
+            logger.info(f"{k}\t{res['recall']:.4f}\t{res['hit']}\t{res['total_pos']}")
+
+
+def save_results(a, b, c, test, dir, method, recall_at_k_by_task=None, recall_at_k_all=None):
     if not is_main_process(): return
 
     cholec80_data = {"F1_score": a[0], "F1_score_EMA": a[1], "Per_video_f1": a[2], "Per_video_f1_EMA": a[3]}
@@ -235,6 +261,18 @@ def save_results(a, b, c, test, dir, method):
         "Endoscapes": endo_data,
         "CholecT50": cholect50_data
     }
+
+    def _format_recall_for_json(recall_results):
+        formatted = {}
+        for task, metrics in recall_results.items():
+            formatted[task] = {str(k): {"recall": float(v["recall"]), "hit": int(v["hit"]), "total_pos": int(v["total_pos"])} for k, v in metrics.items()}
+        return formatted
+
+    if recall_at_k_by_task:
+        data["Recall_at_K"] = _format_recall_for_json(recall_at_k_by_task)
+    if recall_at_k_all:
+        data.setdefault("Recall_at_K", {})
+        data["Recall_at_K"]["all_classes"] = {str(k): {"recall": float(v["recall"]), "hit": int(v["hit"]), "total_pos": int(v["total_pos"])} for k, v in recall_at_k_all.items()}
 
     folder_name = f"results/{dir}"
     os.makedirs(f"results/{dir}", exist_ok=True)
@@ -249,7 +287,7 @@ def save_results(a, b, c, test, dir, method):
     except Exception as e:
         print(f"Error in saving results : {e}")
 
-def calculate_metrics(labels, preds, preds_ema, video_ids, test, dir, method=None):
+def calculate_metrics(labels, preds, preds_ema, video_ids, test, dir, method=None, recall_at_k_by_task=None, recall_at_k_all=None):
     if not is_main_process(): return None, None, None
 
     labels = np.round(labels)
@@ -275,7 +313,7 @@ def calculate_metrics(labels, preds, preds_ema, video_ids, test, dir, method=Non
             c = process_cholect50(filtered_labels, filtered_preds, filtered_preds_ema, filtered_video_ids, test)
 
     if a and b and c:
-        save_results(a, b, c, test, dir, method)
+        save_results(a, b, c, test, dir, method, recall_at_k_by_task=recall_at_k_by_task, recall_at_k_all=recall_at_k_all)
     else:
         pass
     
@@ -388,6 +426,14 @@ class SCPNetTrainer():
 
         logger.info(f"Successfully initialized model: {model_name}")
         self.classnames = classnames
+        self.task_class_indices = get_task_class_indices(self.classnames)
+        if is_main_process():
+            logger.info(
+                "Task class counts -> phase=%d, view=%d, triplet=%d",
+                len(self.task_class_indices.get("phase", [])),
+                len(self.task_class_indices.get("view", [])),
+                len(self.task_class_indices.get("triplet", [])),
+            )
 
         if self.distributed:
             # 将模型中所有的 nn.BatchNorm 转换为 nn.SyncBatchNorm（保证跨卡统计一致）
@@ -581,29 +627,39 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
     all_predictions_ema = np.concatenate(preds_ema, axis=0)
     all_vids = np.array(all_vids)
 
-    calculate_metrics(all_labels, all_predictions_reg, all_predictions_ema, all_vids, False, dir)
-
-    mAP_score_regular = mAP(all_labels, all_predictions_reg)
-    mAP_score_ema = mAP(all_labels, all_predictions_ema)
-    logger.info(f"mAP score regular {mAP_score_regular:.2f}, mAP score EMA {mAP_score_ema:.2f}")
+    recall_logits_all = torch.cat(recall_logits, dim=0)
+    recall_targets_all = torch.cat(recall_targets, dim=0)
 
     recall_at_k_results = compute_recall_at_k(
-        torch.cat(recall_logits, dim=0),
-        torch.cat(recall_targets, dim=0),
+        recall_logits_all,
+        recall_targets_all,
         ks=(1, 3, 5, 10),
-        # TODO: pass class_mask when View/Triplet mappings are available
     )
+    task_recall_results = compute_task_recall(
+        recall_logits_all,
+        recall_targets_all,
+        trainer.task_class_indices,
+        ks=(1, 3, 5, 10),
+    )
+
     logger.info("Recall@K (ALL classes):")
     logger.info("K\tRecall@K\tHit\tTotal_Pos")
     for k in sorted(recall_at_k_results.keys()):
         res = recall_at_k_results[k]
         logger.info(f"{k}\t{res['recall']:.4f}\t{res['hit']}\t{res['total_pos']}")
+    log_recall_results("Validation", task_recall_results)
 
     os.makedirs("outputs", exist_ok=True)
     recall_json_path = os.path.join("outputs", f"recall_at_k_val_epoch{epoch}.json")
     with open(recall_json_path, "w") as f:
-        json.dump(recall_at_k_results, f, indent=2)
+        json.dump({"all_classes": recall_at_k_results, "tasks": task_recall_results}, f, indent=2)
     logger.info(f"Recall@K results saved to {recall_json_path}")
+
+    calculate_metrics(all_labels, all_predictions_reg, all_predictions_ema, all_vids, False, dir, recall_at_k_by_task=task_recall_results, recall_at_k_all=recall_at_k_results)
+
+    mAP_score_regular = mAP(all_labels, all_predictions_reg)
+    mAP_score_ema = mAP(all_labels, all_predictions_ema)
+    logger.info(f"mAP score regular {mAP_score_regular:.2f}, mAP score EMA {mAP_score_ema:.2f}")
     
     mAP_max = max(mAP_score_regular, mAP_score_ema)
     if_ema_better_mAP = mAP_score_ema >= mAP_score_regular
@@ -936,23 +992,33 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
         all_predictions = np.concatenate(preds, axis=0)
         all_vids_np = np.array(all_vids)
         method_name = filename.replace('.ckpt', '')
-        calculate_metrics(all_labels, all_predictions, all_predictions, all_vids_np, True, dir, method=method_name)
+        recall_logits_all = torch.cat(recall_logits, dim=0)
+        recall_targets_all = torch.cat(recall_targets, dim=0)
         recall_at_k_results = compute_recall_at_k(
-            torch.cat(recall_logits, dim=0),
-            torch.cat(recall_targets, dim=0),
+            recall_logits_all,
+            recall_targets_all,
             ks=(1, 3, 5, 10),
-            # TODO: pass class_mask when View/Triplet mappings are available
         )
+        task_recall_results = compute_task_recall(
+            recall_logits_all,
+            recall_targets_all,
+            trainer.task_class_indices,
+            ks=(1, 3, 5, 10),
+        )
+
+        calculate_metrics(all_labels, all_predictions, all_predictions, all_vids_np, True, dir, method=method_name, recall_at_k_by_task=task_recall_results, recall_at_k_all=recall_at_k_results)
+
         logger.info(f"Recall@K (ALL classes) for {method_name}:")
         logger.info("K\tRecall@K\tHit\tTotal_Pos")
         for k in sorted(recall_at_k_results.keys()):
             res = recall_at_k_results[k]
             logger.info(f"{k}\t{res['recall']:.4f}\t{res['hit']}\t{res['total_pos']}")
+        log_recall_results(f"Test ({method_name})", task_recall_results)
 
         os.makedirs("outputs", exist_ok=True)
         recall_json_path = os.path.join("outputs", f"recall_at_k_test_{method_name}.json")
         with open(recall_json_path, "w") as f:
-            json.dump(recall_at_k_results, f, indent=2)
+            json.dump({"all_classes": recall_at_k_results, "tasks": task_recall_results}, f, indent=2)
         logger.info(f"Recall@K results saved to {recall_json_path}")
         processed_epochs.add(epoch_id)
         logger.info(f"Finished testing {method_name}")

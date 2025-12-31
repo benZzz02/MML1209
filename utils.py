@@ -116,6 +116,46 @@ def compute_recall_at_k(logits: torch.Tensor, y_true: torch.Tensor, ks=(1, 3, 5,
     return results
 
 
+def get_task_class_indices(class_names) -> dict:
+    """
+    Build task-specific class index mapping for phase / view(CVS) / triplet heads.
+
+    Args:
+        class_names (Iterable): Ordered class name list that aligns with model logits.
+
+    Returns:
+        dict: {"phase": [...], "view": [...], "triplet": [...]}
+    """
+    task_indices = {"phase": [], "view": [], "triplet": []}
+    for idx, name in enumerate(class_names):
+        name_str = str(name)
+        lower = name_str.lower()
+        if "phase" in lower:
+            task_indices["phase"].append(idx)
+            continue
+        if lower.startswith("view") or lower.startswith("cvs") or "cvs" in lower or "critical view" in lower:
+            task_indices["view"].append(idx)
+            continue
+        if any(token in lower for token in ["tool", "verb", "target", "-"]):
+            task_indices["triplet"].append(idx)
+            continue
+
+    if not task_indices["phase"] and len(class_names) >= 7:
+        task_indices["phase"] = list(range(7))
+    if not task_indices["view"] and len(class_names) >= 10:
+        task_indices["view"] = list(range(7, min(10, len(class_names))))
+
+    assigned = set(task_indices["phase"] + task_indices["view"] + task_indices["triplet"])
+    for idx in range(len(class_names)):
+        if idx not in assigned:
+            task_indices["triplet"].append(idx)
+
+    for key in task_indices:
+        task_indices[key] = sorted(set(task_indices[key]))
+
+    return task_indices
+
+
 if __name__ == "__main__":
     _logits = torch.tensor([
         [0.9, 0.1, 0.8, 0.2, 0.0],
