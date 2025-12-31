@@ -53,6 +53,84 @@ def mAP(targs, preds):
     return 100 * ap.mean()
 
 
+def _prepare_class_mask(class_mask, num_classes: int) -> torch.Tensor:
+    if class_mask is None:
+        return torch.ones(num_classes, dtype=torch.bool)
+    if isinstance(class_mask, torch.Tensor):
+        mask = class_mask.detach().cpu().bool()
+    else:
+        mask = torch.zeros(num_classes, dtype=torch.bool)
+        mask[class_mask] = True
+    if mask.numel() != num_classes:
+        raise ValueError(f"class_mask has {mask.numel()} entries, expected {num_classes}")
+    return mask
+
+
+def compute_recall_at_k(logits: torch.Tensor, y_true: torch.Tensor, ks=(1, 3, 5, 10), class_mask=None):
+    """Compute Recall@K for multi-label predictions.
+
+    Args:
+        logits (Tensor): Shape [N, C], raw scores.
+        y_true (Tensor): Shape [N, C], multi-hot ground truth.
+        ks (tuple): Iterable of K values.
+        class_mask: Optional boolean mask or list of class indices to restrict computation.
+
+    Returns:
+        dict: {K: {"recall": float, "hit": int, "total_pos": int}}
+    """
+    if logits.dim() != 2 or y_true.dim() != 2:
+        raise ValueError("logits and y_true must be 2D tensors with shape [N, C]")
+
+    logits_cpu = logits.detach().cpu()
+    y_true_cpu = y_true.detach().cpu()
+
+    num_classes = logits_cpu.size(1)
+    mask = _prepare_class_mask(class_mask, num_classes)
+    logits_cpu = logits_cpu[:, mask]
+    y_true_cpu = y_true_cpu[:, mask]
+
+    if logits_cpu.numel() == 0:
+        raise ValueError("No classes available after applying class_mask")
+
+    positive_per_sample = y_true_cpu.sum(dim=1)
+    valid_mask = positive_per_sample > 0
+
+    results = {}
+    if valid_mask.sum() == 0:
+        for k in ks:
+            results[k] = {"recall": 0.0, "hit": 0, "total_pos": 0}
+        return results
+
+    y_true_valid = y_true_cpu[valid_mask]
+    logits_valid = logits_cpu[valid_mask]
+    total_pos = int(y_true_valid.sum().item())
+
+    for k in ks:
+        k_eff = min(k, logits_valid.size(1))
+        topk_idx = torch.topk(logits_valid, k=k_eff, dim=1).indices
+        hits = torch.gather(y_true_valid, 1, topk_idx).sum(dim=1)
+        hit_total = int(hits.sum().item())
+        recall = float(hit_total / total_pos) if total_pos > 0 else 0.0
+        results[k] = {"recall": recall, "hit": hit_total, "total_pos": total_pos}
+
+    return results
+
+
+if __name__ == "__main__":
+    _logits = torch.tensor([
+        [0.9, 0.1, 0.8, 0.2, 0.0],
+        [0.05, 0.6, 0.1, 0.2, 0.7]
+    ])
+    _y_true = torch.tensor([
+        [1, 0, 1, 0, 0],
+        [0, 1, 0, 0, 1]
+    ], dtype=torch.float32)
+    _res = compute_recall_at_k(_logits, _y_true, ks=(1, 3, 5, 10))
+    assert _res[1]["hit"] == 2 and abs(_res[1]["recall"] - 0.5) < 1e-6
+    assert _res[3]["hit"] == 4 and abs(_res[3]["recall"] - 1.0) < 1e-6
+    assert _res[5]["total_pos"] == 4 and _res[10]["hit"] == 4
+
+
 class AverageMeter(object):
 
     def __init__(self):

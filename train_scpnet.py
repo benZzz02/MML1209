@@ -30,7 +30,7 @@ from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
     iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency,Hill_Ignore
 )
-from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure, TopKCheckpointManager
+from utils import AverageMeter, add_weight_decay, mAP, compute_recall_at_k
 from config import cfg
 from consistency import ConsistencyAugmentor
 
@@ -537,6 +537,7 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
     
     sigmoid = torch.sigmoid
     preds_regular, preds_ema, all_vids, targets = [], [], [], []
+    recall_logits, recall_targets = [], []
     losses, losses_ema = [], []
 
     model_to_run = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
@@ -569,6 +570,8 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
         preds_ema.append(output_ema.cpu().numpy())
         targets.append(target.cpu().numpy())
         all_vids.extend(vid)
+        recall_logits.append(output_ema_logits.detach().cpu())
+        recall_targets.append(target.detach().cpu())
 
     loss_mean = mean(losses)
     loss_mean_ema = mean(losses_ema)
@@ -583,6 +586,24 @@ def validate(trainer, epoch: int, dir, criterion=None) -> dict:
     mAP_score_regular = mAP(all_labels, all_predictions_reg)
     mAP_score_ema = mAP(all_labels, all_predictions_ema)
     logger.info(f"mAP score regular {mAP_score_regular:.2f}, mAP score EMA {mAP_score_ema:.2f}")
+
+    recall_at_k_results = compute_recall_at_k(
+        torch.cat(recall_logits, dim=0),
+        torch.cat(recall_targets, dim=0),
+        ks=(1, 3, 5, 10),
+        # TODO: pass class_mask when View/Triplet mappings are available
+    )
+    logger.info("Recall@K (ALL classes):")
+    logger.info("K\tRecall@K\tHit\tTotal_Pos")
+    for k in sorted(recall_at_k_results.keys()):
+        res = recall_at_k_results[k]
+        logger.info(f"{k}\t{res['recall']:.4f}\t{res['hit']}\t{res['total_pos']}")
+
+    os.makedirs("outputs", exist_ok=True)
+    recall_json_path = os.path.join("outputs", f"recall_at_k_val_epoch{epoch}.json")
+    with open(recall_json_path, "w") as f:
+        json.dump(recall_at_k_results, f, indent=2)
+    logger.info(f"Recall@K results saved to {recall_json_path}")
     
     mAP_max = max(mAP_score_regular, mAP_score_ema)
     if_ema_better_mAP = mAP_score_ema >= mAP_score_regular
@@ -744,22 +765,6 @@ def train(trainer, dir) -> list:
     save_dir_base = os.path.join(cfg.checkpoint, dir)
     if is_main_process(): os.makedirs(save_dir_base, exist_ok=True)
 
-    use_cap = getattr(cfg, 'use_cap', False)
-    cap_start_epoch = getattr(cfg, 'cap_start_epoch', 5)
-    cap_ratio = getattr(cfg, 'cap_ratio', 0.6)
-    pos_freq = None
-    if use_cap:
-        if is_main_process():
-            pos_freq = estimate_class_distribution(trainer.train_loader.dataset, cfg.num_classes)
-            if dist.is_initialized() and pos_freq is not None:
-                pos_freq_t = torch.from_numpy(pos_freq).cuda()
-                dist.broadcast(pos_freq_t, 0)
-        else:
-            if dist.is_initialized():
-                pos_freq_t = torch.zeros(cfg.num_classes).cuda()
-                dist.broadcast(pos_freq_t, 0)
-                pos_freq = pos_freq_t.cpu().numpy()
-    
     trainer.model.train()
 
     if cfg.perform_init:
@@ -820,11 +825,6 @@ def train(trainer, dir) -> list:
         if hasattr(trainer.train_loader, 'sampler') and hasattr(trainer.train_loader.sampler, 'set_epoch'):
              trainer.train_loader.sampler.set_epoch(epoch)
 
-        if use_cap and epoch >= cap_start_epoch and pos_freq is not None:
-             if dist.is_initialized(): dist.barrier()
-             run_cap_procedure(trainer, trainer.train_loader, pos_freq, device=torch.device(f"cuda:{cfg.gpu_id}"), ratio=cap_ratio)
-             if dist.is_initialized(): dist.barrier()
-    
         optimizer.zero_grad()
         for i, batch_data in enumerate(trainer.train_loader):
             input = batch_data[0]
@@ -916,6 +916,7 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
         model_to_run.eval()
 
         preds, targets, all_vids = [], [], []
+        recall_logits, recall_targets = [], []
         for i, (input, target, vid) in enumerate(trainer.test_loader):
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
@@ -928,12 +929,31 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
             preds.append(output.cpu().numpy())
             targets.append(target.cpu().numpy())
             all_vids.extend(vid)
+            recall_logits.append(output_logits.detach().cpu())
+            recall_targets.append(target.detach().cpu())
 
         all_labels = np.concatenate(targets, axis=0)
         all_predictions = np.concatenate(preds, axis=0)
         all_vids_np = np.array(all_vids)
         method_name = filename.replace('.ckpt', '')
         calculate_metrics(all_labels, all_predictions, all_predictions, all_vids_np, True, dir, method=method_name)
+        recall_at_k_results = compute_recall_at_k(
+            torch.cat(recall_logits, dim=0),
+            torch.cat(recall_targets, dim=0),
+            ks=(1, 3, 5, 10),
+            # TODO: pass class_mask when View/Triplet mappings are available
+        )
+        logger.info(f"Recall@K (ALL classes) for {method_name}:")
+        logger.info("K\tRecall@K\tHit\tTotal_Pos")
+        for k in sorted(recall_at_k_results.keys()):
+            res = recall_at_k_results[k]
+            logger.info(f"{k}\t{res['recall']:.4f}\t{res['hit']}\t{res['total_pos']}")
+
+        os.makedirs("outputs", exist_ok=True)
+        recall_json_path = os.path.join("outputs", f"recall_at_k_test_{method_name}.json")
+        with open(recall_json_path, "w") as f:
+            json.dump(recall_at_k_results, f, indent=2)
+        logger.info(f"Recall@K results saved to {recall_json_path}")
         processed_epochs.add(epoch_id)
         logger.info(f"Finished testing {method_name}")
 

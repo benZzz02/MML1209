@@ -916,6 +916,10 @@ def get_topk_related_labels(pred_idx: int, logits_row: torch.Tensor, A_star: tor
 def compensate_logits_by_pred_prob(logits: torch.Tensor, pred_idx: torch.Tensor, topk_related_labels: list):
     alpha = _cfg("SCP_COMP_ALPHA", 2.0)
     temp = _cfg("SCP_COMP_TEMP", 1.0)
+    use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True)
+
+    if not use_comp:
+        return logits
 
     logits_comp = logits.clone()
     probs = F.softmax(logits_comp / temp, dim=-1)
@@ -984,16 +988,25 @@ class MMLSurgAdaptSCPNet(nn.Module):
         logits = 10.0 * image_features @ text_features_refined.t()
 
         # build topk + ignore mask + compensate
-        pred_idx = logits.argmax(dim=-1)
-        topk_related_labels = []
-        for b in range(pred_idx.shape[0]):
-            topk_related_labels.append(
-                get_topk_related_labels(int(pred_idx[b].item()), logits[b], self.A_star)
-            )
+        use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True)
+        use_ignore_mask = _cfg("SCP_ENABLE_IGNORE_MASK", True)
 
-        ignore_neg_mask = build_ignore_neg_mask_from_topk(
-            topk_related_labels, n_cls=logits.shape[1], device=logits.device
-        )
+        ignore_neg_mask = None
+        if use_comp or use_ignore_mask:
+            pred_idx = logits.argmax(dim=-1)
+            topk_related_labels = []
+            for b in range(pred_idx.shape[0]):
+                topk_related_labels.append(
+                    get_topk_related_labels(int(pred_idx[b].item()), logits[b], self.A_star)
+                )
 
-        logits = compensate_logits_by_pred_prob(logits, pred_idx, topk_related_labels)
-        return logits, ignore_neg_mask
+            if use_ignore_mask:
+                ignore_neg_mask = build_ignore_neg_mask_from_topk(
+                    topk_related_labels, n_cls=logits.shape[1], device=logits.device
+                )
+
+            if use_comp:
+                logits = compensate_logits_by_pred_prob(logits, pred_idx, topk_related_labels)
+            return logits, ignore_neg_mask
+
+        return logits
