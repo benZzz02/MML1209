@@ -63,31 +63,16 @@ test_dir: trial_test_scpnet_hill_Ignore_sp  # Directory to save results
 test_loss: Hill  # Loss function
 
 
-# ============================
-# SCPNet / SCP settings (match your model.py)
-# ============================
+
 gcn_layers: 3
-
-# Matrix post-process knobs used in StructuredPriorPrompter
-sim_threshold: 0.05          # used as fallback
-SCP_SIM_THRESHOLD: 0.05      # explicit (recommended)
-SCP_S_REWEIGHT: 0.2          # self-loop weight (diagonal); if absent falls back to reweight_p
-
-# Top-k retrieval for ignore + compensate
+sim_threshold: 0.05
 SCP_TOPK_K: 1
-SCP_TOPK_USE_SIGMOID: False  # False -> use softmax(logits_row) as conf; True -> sigmoid(logits_row)
-
-# Compensate parameters (IMPORTANT: TEMP MUST NOT BE 0)
 SCP_COMP_ALPHA: 2.0
 SCP_COMP_TEMP: 1.0
 SCP_TOPK_USE_SIGMOID: False
-
-debug: True
-debug_step: 200
-
-
-# ============================
-# Debug
-# ============================
+SCP_ENABLE_LOGIT_COMP: True
+SCP_ENABLE_IGNORE_MASK: True
+SCP_EXTERNAL_MATRIX_PATH: matrix.npy
+SCP_EXTERNAL_MATRIX_WEIGHT: 0.5
 debug: True
 debug_step: 200
