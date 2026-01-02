@@ -7,7 +7,7 @@ log_file: scpnet_hill_Ignore_sp.txt
 model_name: scpnet
 batch_size: 20
 accumulation_steps: 2
-lr: 3e-5
+lr: 1xe-5
 epochs: 10
 
 reweight_p: 0.2
@@ -40,7 +40,7 @@ init_epochs: 5
 init_lr: 1e-5
 
 dir: trial_scpnet_hill_Ignore_sp  # Directory to save results
-loss: Hill  # Loss function
+loss: Hill_Ignore  # Loss function
 
 use_lfile: False  # If use label file
 getitem: False    # If call random in getitem
@@ -60,7 +60,7 @@ model: SCPNet
 # ============================
 ckpt: temp.ckpt  # Ckpt path for inference
 test_dir: trial_test_scpnet_hill_Ignore_sp  # Directory to save results
-test_loss: Hill  # Loss function
+test_loss: Hill_Ignore  # Loss function
 
 
 
@@ -73,6 +73,6 @@ SCP_TOPK_USE_SIGMOID: False
 SCP_ENABLE_LOGIT_COMP: True
 SCP_ENABLE_IGNORE_MASK: True
 SCP_EXTERNAL_MATRIX_PATH: matrix.npy
-SCP_EXTERNAL_MATRIX_WEIGHT: 0.5
+SCP_EXTERNAL_MATRIX_WEIGHT: 0.2
 debug: True
 debug_step: 200
