@@ -2,12 +2,12 @@
 # Training
 # ============================
 n_ctx: 4
-checkpoint: cholec_vals/scpnet_hill_Ignore_pp    # For saving checkpoints
+checkpoint: cholec_vals/scpnet_hill_Ignore_sp    # For saving checkpoints
 log_file: scpnet_hill_Ignore_sp.txt
 model_name: scpnet
 batch_size: 20
 accumulation_steps: 2
-lr: 1xe-5
+lr: 1e-5
 epochs: 10
 
 reweight_p: 0.2
@@ -76,3 +76,12 @@ SCP_EXTERNAL_MATRIX_PATH: matrix.npy
 SCP_EXTERNAL_MATRIX_WEIGHT: 0.2
 debug: True
 debug_step: 200
+mimic_single_card: true            # 多卡模拟单卡全局步数
+strict_deterministic: true         # 开启确定性（可能稍降吞吐）
+allow_tf32: false                  # 关闭 TF32，配合确定性
+
+# 目标全局 batch（可选）
+target_global_batch: 60         # 例：8 卡 * 20 batch_per_gpu；设定后代码会自动分配 per-GPU batch
+
+# 调度粒度
+scheduler_granularity: per_step    # 与 mimic_single_card 搭配，保证与单卡步数对齐
