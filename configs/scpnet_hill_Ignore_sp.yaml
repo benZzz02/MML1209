@@ -70,15 +70,15 @@ SCP_TOPK_K: 1
 SCP_COMP_ALPHA: 2.0
 SCP_COMP_TEMP: 1.0
 SCP_TOPK_USE_SIGMOID: False
-SCP_ENABLE_LOGIT_COMP: True
+SCP_ENABLE_LOGIT_COMP: False
 SCP_ENABLE_IGNORE_MASK: True
-SCP_EXTERNAL_MATRIX_PATH: matrix.npy
-SCP_EXTERNAL_MATRIX_WEIGHT: 0.2
+SCP_EXTERNAL_MATRIX_PATH: surgical_cooccurrence_matrix.npy
+SCP_EXTERNAL_MATRIX_WEIGHT: 0.0
 debug: True
 debug_step: 200
 mimic_single_card: true            # 多卡模拟单卡全局步数
 strict_deterministic: true         # 开启确定性（可能稍降吞吐）
-allow_tf32: false                  # 关闭 TF32，配合确定性
+allow_tf32: true                  # 关闭 TF32，配合确定性
 
 # 目标全局 batch（可选）
 target_global_batch: 60         # 例：8 卡 * 20 batch_per_gpu；设定后代码会自动分配 per-GPU batch
