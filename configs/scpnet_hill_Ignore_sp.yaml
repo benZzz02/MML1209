@@ -3,8 +3,8 @@ n_ctx: 4
 checkpoint: cholec_vals/scpnet_hill_Ignore_sp    # For saving checkpoints
 log_file: scpnet_hill_Ignore_sp.txt
 model_name: scpnet
-batch_size: 32
-accumulation_steps: 1
+batch_size: 20
+accumulation_steps: 2
 lr: 3e-5
 epochs: 10
 reweight_p: 0.2
@@ -53,8 +53,12 @@ SCP_TOPK_K: 1
 SCP_COMP_ALPHA: 2.0
 SCP_COMP_TEMP: 1.0
 SCP_TOPK_USE_SIGMOID: False
-
+SCP_ENABLE_LOGIT_COMP: True
+SCP_ENABLE_IGNORE_MASK: False
 debug: True
 debug_step: 200
+SCP_EXTERNAL_MATRIX_PATH: surgical_cooccurence_matrix.npy
+SCP_GATE_INIT_BETA: -4.0
+SCP_LOG_GATE: True
 
 

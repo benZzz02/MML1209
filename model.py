@@ -747,10 +747,21 @@ class HSPNet(nn.Module):
 # SCPNet (minimal cfg, no garbage)
 # ======================================================================
 class StructuredPriorPrompter(nn.Module):
+    """
+    Minimal-intrusion version:
+    - If cfg.SCP_EXTERNAL_MATRIX_PATH is NOT set or invalid -> EXACTLY original behavior:
+        - build A_final from CLIP sim
+        - register_buffer("A_star", A_final)
+        - forward() returns self.A_star
+    - If external matrix path is valid and shape matches -> enable 3 learnable gates (pv/pa/va):
+        - store A_clip_star (CLIP-graph) and A_ext_star (structured external prob-graph)
+        - forward() returns gated fusion ONLY on cross-group blocks
+    """
+
     def __init__(self, classnames, clip_model):
         super().__init__()
 
-        # only meaningful knobs
+        # only meaningful knobs (same as your original)
         s_reweight = _cfg("SCP_S_REWEIGHT", _cfg("reweight_p", 0.2))
         sim_threshold = _cfg("SCP_SIM_THRESHOLD", _cfg("sim_threshold", 0.05))
 
@@ -758,8 +769,11 @@ class StructuredPriorPrompter(nn.Module):
             classnames = classnames[0 : cfg.child_num]
 
         self.n_cls = len(classnames)
+        self.s_reweight = s_reweight
+        self.sim_threshold = sim_threshold
         dtype = clip_model.dtype
 
+        # -------- CLIP text embedding similarity (same as your original) --------
         template = "a photo of a {}."
         classnames_proc = [name.replace("_", " ") for name in classnames]
         prompts = [template.format(name) for name in classnames_proc]
@@ -775,8 +789,9 @@ class StructuredPriorPrompter(nn.Module):
         phase_range = slice(0, 7)
         view_range = slice(7, 10)
         action_range = slice(10, self.n_cls)
+        ranges = [(0, 7), (7, 10), (10, self.n_cls)]
 
-        # mutual-exclusive within each big group
+        # mutual-exclusive within each big group (same)
         structure_mask = torch.ones_like(A_raw, dtype=torch.bool)
         structure_mask[phase_range, phase_range] = False
         structure_mask[view_range, view_range] = False
@@ -785,9 +800,8 @@ class StructuredPriorPrompter(nn.Module):
 
         A_masked = A_raw * structure_mask.float()
 
-        # block-wise max norm
+        # block-wise max norm (same)
         A_norm = torch.zeros_like(A_masked)
-        ranges = [(0, 7), (7, 10), (10, self.n_cls)]
         for src_start, src_end in ranges:
             for tgt_start, tgt_end in ranges:
                 block = A_masked[src_start:src_end, tgt_start:tgt_end]
@@ -797,57 +811,139 @@ class StructuredPriorPrompter(nn.Module):
                 block_max, _ = block.max(dim=1, keepdim=True)
                 A_norm[src_start:src_end, tgt_start:tgt_end] = block / (block_max + 1e-12)
 
-        # self-loop
+        # self-loop (same)
         A_final = A_norm
         diag = torch.eye(self.n_cls, dtype=torch.bool, device=A_raw.device)
         A_final[diag] = 0.0
         A_final = A_final * (1.0 - s_reweight)
         A_final[diag] = s_reweight
 
+        # ============================================================
+        # NEW: enable 3-gate fusion ONLY when external_path is valid
+        # ============================================================
+        self.use_gate = False
         external_path = getattr(cfg, "SCP_EXTERNAL_MATRIX_PATH", None)
-        external_weight = getattr(cfg, "SCP_EXTERNAL_MATRIX_WEIGHT", 0.5)
 
-        if external_path:
-            if os.path.isfile(external_path):
-                try:
-                    external_matrix = np.load(external_path, allow_pickle=False)
-                except Exception as e:
+        if external_path and os.path.isfile(external_path):
+            try:
+                external_matrix = np.load(external_path, allow_pickle=False)
+            except Exception as e:
+                logger.warning(f"SCP external matrix failed to load from {external_path}: {e}. Use original A_star.")
+            else:
+                if isinstance(external_matrix, np.lib.npyio.NpzFile):
                     logger.warning(
-                        f"SCP external matrix failed to load from {external_path}: {e}. Skipping merge."
+                        f"SCP external matrix expected .npy but got .npz at {external_path}. Use original A_star."
                     )
                 else:
-                    if isinstance(external_matrix, np.lib.npyio.NpzFile):
+                    ext = torch.as_tensor(external_matrix, dtype=A_final.dtype, device=A_final.device)
+                    if ext.shape != A_final.shape:
                         logger.warning(
-                            f"SCP external matrix expected .npy but got .npz at {external_path}. Skipping merge."
+                            f"SCP external matrix shape mismatch: expected {A_final.shape}, got {ext.shape}. "
+                            "Use original A_star."
                         )
                     else:
-                        external_tensor = torch.as_tensor(
-                            external_matrix, dtype=A_final.dtype, device=A_final.device
+                        # ext is strictly 0~1 (prob); structure it to align with SCP
+                        A_ext = self._structure_external_prob(
+                            ext=ext,
+                            phase_range=phase_range,
+                            view_range=view_range,
+                            action_range=action_range,
+                            ranges=ranges,
+                            diag=diag,
                         )
 
-                        if external_tensor.shape == A_final.shape:
-                            weight = float(external_weight)
-                            weight = min(max(weight, 0.0), 1.0)
-                            A_final = (1.0 - weight) * A_final + weight * external_tensor
-                            logger.info(
-                                f"SCP external matrix loaded from {external_path} with weight {weight:.3f}"
-                            )
-                        else:
-                            logger.warning(
-                                "SCP external matrix shape mismatch: "
-                                f"expected {A_final.shape}, got {external_tensor.shape}. Skipping merge."
-                            )
-            else:
-                logger.warning(
-                    f"SCP external matrix path not found: {external_path}. Skipping merge."
-                )
+                        # store both graphs
+                        self.register_buffer("A_clip_star", A_final.clone())
+                        self.register_buffer("A_ext_star", A_ext)
 
-        
-        
-        self.register_buffer("A_star", A_final)
+                        # 3 learnable gates: init near 0 -> start ~ CLIP-only
+                        init_beta = _cfg("SCP_GATE_INIT_BETA", -4.0)  # sigmoid(-4)=0.018
+                        self.beta_pv = nn.Parameter(torch.tensor(float(init_beta)))
+                        self.beta_pa = nn.Parameter(torch.tensor(float(init_beta)))
+                        self.beta_va = nn.Parameter(torch.tensor(float(init_beta)))
+
+                        self.use_gate = True
+                        logger.info(f"SCP external matrix loaded from {external_path}. Enable 3-gate fusion.")
+        elif external_path:
+            logger.warning(f"SCP external matrix path not found: {external_path}. Use original A_star.")
+
+        # original behavior: fixed A_star buffer
+        if not self.use_gate:
+            self.register_buffer("A_star", A_final)
+
+    def _structure_external_prob(self, ext, phase_range, view_range, action_range, ranges, diag):
+        """
+        ext: (N,N) probability matrix strictly in [0,1].
+        Align it with SCP-style adjacency:
+          - symmetrize
+          - zero within-group edges
+          - block-wise row-max normalization
+          - same self-loop reweighting
+        """
+        P = ext.clone().clamp(0.0, 1.0)
+        P = 0.5 * (P + P.t())  # symmetrize co-occurrence
+
+        # respect mutual exclusivity within each group
+        P[phase_range, phase_range] = 0.0
+        P[view_range, view_range] = 0.0
+        P[action_range, action_range] = 0.0
+
+        # block-wise row-max norm
+        P_norm = torch.zeros_like(P)
+        for src_start, src_end in ranges:
+            for tgt_start, tgt_end in ranges:
+                block = P[src_start:src_end, tgt_start:tgt_end]
+                if block.sum() == 0:
+                    continue
+                block_max, _ = block.max(dim=1, keepdim=True)
+                P_norm[src_start:src_end, tgt_start:tgt_end] = block / (block_max + 1e-12)
+
+        # self-loop same as CLIP graph
+        P_norm[diag] = 0.0
+        P_norm = P_norm * (1.0 - self.s_reweight)
+        P_norm[diag] = self.s_reweight
+        return P_norm
 
     def forward(self):
-        return self.A_star
+        # original behavior
+        if not self.use_gate:
+            return self.A_star
+
+        # gated fusion only on cross-group blocks
+        A = self.A_clip_star.clone()
+
+        phase_range = slice(0, 7)
+        view_range = slice(7, 10)
+        action_range = slice(10, self.n_cls)
+
+        w_pv = torch.sigmoid(self.beta_pv)
+        w_pa = torch.sigmoid(self.beta_pa)
+        w_va = torch.sigmoid(self.beta_va)
+
+        # pv + vp
+        A[phase_range, view_range] = (1 - w_pv) * self.A_clip_star[phase_range, view_range] + w_pv * self.A_ext_star[phase_range, view_range]
+        A[view_range, phase_range] = (1 - w_pv) * self.A_clip_star[view_range, phase_range] + w_pv * self.A_ext_star[view_range, phase_range]
+
+        # pa + ap
+        A[phase_range, action_range] = (1 - w_pa) * self.A_clip_star[phase_range, action_range] + w_pa * self.A_ext_star[phase_range, action_range]
+        A[action_range, phase_range] = (1 - w_pa) * self.A_clip_star[action_range, phase_range] + w_pa * self.A_ext_star[action_range, phase_range]
+
+        # va + av
+        A[view_range, action_range] = (1 - w_va) * self.A_clip_star[view_range, action_range] + w_va * self.A_ext_star[view_range, action_range]
+        A[action_range, view_range] = (1 - w_va) * self.A_clip_star[action_range, view_range] + w_va * self.A_ext_star[action_range, view_range]
+
+        return A
+
+    @torch.no_grad()
+    def gate_weights(self):
+        if not self.use_gate:
+            return {"use_gate": False}
+        return {
+            "use_gate": True,
+            "w_pv": float(torch.sigmoid(self.beta_pv).item()),
+            "w_pa": float(torch.sigmoid(self.beta_pa).item()),
+            "w_va": float(torch.sigmoid(self.beta_va).item()),
+        }
 
 
 class SemanticAssociationModule(nn.Module):
@@ -952,8 +1048,13 @@ class MMLSurgAdaptSCPNet(nn.Module):
         self.prompt_learner = PromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
 
+        # Structured prior prompter (may or may not use gate)
         self.spp = StructuredPriorPrompter(classnames, clip_model)
-        self.register_buffer("A_star", self.spp())
+        self.use_gate = getattr(self.spp, "use_gate", False)
+
+        # Keep EXACT original behavior when no external -> register fixed A_star buffer
+        if not self.use_gate:
+            self.register_buffer("A_star", self.spp())
 
         try:
             feat_dim = clip_model.text_projection.shape[1]
@@ -974,26 +1075,28 @@ class MMLSurgAdaptSCPNet(nn.Module):
         child_prompts = self.prompt_learner()
         Z = self.text_encoder(child_prompts, self.tokenized_prompts)
 
+        # choose A_star: dynamic when gate enabled; fixed buffer otherwise (original)
+        A_star = self.spp() if self.use_gate else self.A_star
+
         # GCN needs row-sum normalized adjacency
-        row_sum = self.A_star.sum(dim=1, keepdim=True)
-        A_gcn = self.A_star / (row_sum + 1e-12)
+        row_sum = A_star.sum(dim=1, keepdim=True)
+        A_gcn = A_star / (row_sum + 1e-12)
 
         text_features_refined = self.sam(Z, A_gcn)
         text_features_refined = text_features_refined / text_features_refined.norm(dim=-1, keepdim=True)
 
         logits = 10.0 * image_features @ text_features_refined.t()
 
-        # ===== switches =====
+        # ===== switches (same as your version) =====
         use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True)
         use_ignore = _cfg("SCP_ENABLE_IGNORE_MASK", True)
 
         ignore_neg_mask = None
 
-        # only compute topk if needed
         if use_comp or use_ignore:
             pred_idx = logits.argmax(dim=-1)
             topk_related_labels = [
-                get_topk_related_labels(int(pred_idx[b].item()), logits[b], self.A_star)
+                get_topk_related_labels(int(pred_idx[b].item()), logits[b], A_star)
                 for b in range(pred_idx.shape[0])
             ]
 
@@ -1005,5 +1108,4 @@ class MMLSurgAdaptSCPNet(nn.Module):
             if use_comp:
                 logits = compensate_logits_by_pred_prob(logits, pred_idx, topk_related_labels)
 
-        # always return tuple for safety
         return logits, ignore_neg_mask
