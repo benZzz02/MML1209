@@ -30,7 +30,7 @@ from loss import (
     SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, 
     iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL,GPRLoss,BBAMLossVisual, GCELoss,SCELoss,Hill_Consistency,SPLC_Consistency,Hill_Ignore
 )
-from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure, TopKCheckpointManager
+from utils import AverageMeter, add_weight_decay, mAP, estimate_class_distribution, run_cap_procedure, TopKCheckpointManager,compute_pr_sidecar, save_pr_npz_and_png,merge_pr_points_into_result_json
 from config import cfg
 from consistency import ConsistencyAugmentor
 
@@ -484,6 +484,25 @@ class SCPNetTrainer():
                     f"top1_prob={top1_prob:.3f} | "
                     f"ignore/cls={ignore_cnt:.2f}"
                 )
+                try:
+                    m = self.model_unwrap  # DDP unwrap 后的真实模型
+                    spp = getattr(m, "spp", None)
+                    if spp is not None and getattr(spp, "use_gate", False) and hasattr(spp, "gate_weights"):
+                        gw = spp.gate_weights()  # {"use_gate":True,"w_pv":..,"w_pa":..,"w_va":..}
+                        if gw.get("use_gate", False):
+                            # 同时把 beta 打出来，方便你看是不是在动
+                            beta_pv = float(getattr(spp, "beta_pv").detach().cpu().item()) if hasattr(spp, "beta_pv") else float("nan")
+                            beta_pa = float(getattr(spp, "beta_pa").detach().cpu().item()) if hasattr(spp, "beta_pa") else float("nan")
+                            beta_va = float(getattr(spp, "beta_va").detach().cpu().item()) if hasattr(spp, "beta_va") else float("nan")
+
+                            logger.info(
+                                f"[DEBUG][GATE][E{epoch}][I{epoch_i}] "
+                                f"w_pv={gw['w_pv']:.4f} (beta_pv={beta_pv:.3f}) | "
+                                f"w_pa={gw['w_pa']:.4f} (beta_pa={beta_pa:.3f}) | "
+                                f"w_va={gw['w_va']:.4f} (beta_va={beta_va:.3f})"
+                            )
+                except Exception as e:
+                    logger.warning(f"[DEBUG][GATE] failed to fetch gate weights: {e}")
         if debug and is_main_process() and epoch_i % debug_step == 0:
             with torch.no_grad():
                 pred_idx = logits.argmax(dim=-1)
@@ -934,6 +953,9 @@ def test(trainer, dir, checkpoint_paths=None) -> None:
         all_vids_np = np.array(all_vids)
         method_name = filename.replace('.ckpt', '')
         calculate_metrics(all_labels, all_predictions, all_predictions, all_vids_np, True, dir, method=method_name)
+        pr_data = compute_pr_sidecar(all_labels, all_predictions, all_vids_np, pr_targets=(0.3,0.5, 0.7, 0.8), max_points=20000)
+        merged_path = merge_pr_points_into_result_json(pr_data, dir, test=True)
+        save_pr_npz_and_png(pr_data, dir, test=True, result_json_path=merged_path)
         processed_epochs.add(epoch_id)
         logger.info(f"Finished testing {method_name}")
 

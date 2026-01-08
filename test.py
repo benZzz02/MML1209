@@ -18,7 +18,7 @@ from torch.optim import lr_scheduler
 
 from loss import SPLC, GRLoss, Hill, AsymmetricLossOptimized, WAN, VLPL_Loss, iWAN, G_AN, LL, Weighted_Hill, Modified_VLPL
 from mmlsurgadapt import MMLSurgAdaptTrainer
-from utils import AverageMeter, add_weight_decay, mAP
+from utils import AverageMeter, add_weight_decay, mAP, compute_pr_sidecar, save_pr_npz_and_png
 import warnings
 
 from config import cfg
@@ -404,6 +404,9 @@ def test_phase(trainer, ckpt, dir, criterion, gpu_id) -> None:
     
     # 计算指标
     calculate_metrics(all_labels, all_predictions_reg, all_predictions_ema, all_vids, True, dir)
+        # ===== 旁路：PR 曲线数组文件 + PNG 可视化（不影响你原 result_*.json）=====
+    pr_data = compute_pr_sidecar(all_labels, all_predictions_reg, all_vids, pr_targets=(0.30,0.50,0.70,0.80), max_points=20000)
+    save_pr_npz_and_png(pr_data, dir, ckpt, test=True)
 
     mAP_calc = mAP(all_labels, all_predictions_reg)
     loss_calc = sum(losses)/len(losses)
