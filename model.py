@@ -747,192 +747,171 @@ class HSPNet(nn.Module):
 # SCPNet (minimal cfg, no garbage)
 # ======================================================================
 class StructuredPriorPrompter(nn.Module):
-    """
-    Minimal-intrusion version:
-    - If cfg.SCP_EXTERNAL_MATRIX_PATH is NOT set or invalid -> EXACTLY original behavior:
-        - build A_final from CLIP sim
-        - register_buffer("A_star", A_final)
-        - forward() returns self.A_star
-    - If external matrix path is valid and shape matches -> enable 3 learnable gates (pv/pa/va):
-        - store A_clip_star (CLIP-graph) and A_ext_star (structured external prob-graph)
-        - forward() returns gated fusion ONLY on cross-group blocks
-    """
-
     def __init__(self, classnames, clip_model):
         super().__init__()
 
-        # only meaningful knobs (same as your original)
-        s_reweight = _cfg("SCP_S_REWEIGHT", _cfg("reweight_p", 0.2))
-        sim_threshold = _cfg("SCP_SIM_THRESHOLD", _cfg("sim_threshold", 0.05))
+        self.s_reweight = _cfg("SCP_S_REWEIGHT", _cfg("reweight_p", 0.2))
+        self.sim_threshold = _cfg("SCP_SIM_THRESHOLD", _cfg("sim_threshold", 0.05))
+        self.baseline_mode = getattr(cfg, "SCP_BASELINE_MODE", "01")  # "01" (方案A默认) or "cos"
 
         if hasattr(cfg, "child_num") and cfg.child_num > 0:
             classnames = classnames[0 : cfg.child_num]
-
         self.n_cls = len(classnames)
-        self.s_reweight = s_reweight
-        self.sim_threshold = sim_threshold
         dtype = clip_model.dtype
 
-        # -------- CLIP text embedding similarity (same as your original) --------
+        # ranges
+        self.phase_range = slice(0, 7)
+        self.view_range = slice(7, 10)
+        self.action_range = slice(10, self.n_cls)
+        self.ranges = [(0, 7), (7, 10), (10, self.n_cls)]
+
+        # ---- CLIP text similarity (cosine) ----
         template = "a photo of a {}."
-        classnames_proc = [name.replace("_", " ") for name in classnames]
-        prompts = [template.format(name) for name in classnames_proc]
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        classnames_proc = [n.replace("_", " ") for n in classnames]
+        prompts = [template.format(n) for n in classnames_proc]
+        tokenized = torch.cat([clip.tokenize(p) for p in prompts])
 
         with torch.no_grad():
-            z_static = clip_model.encode_text(tokenized_prompts).type(dtype)
-        z_static = F.normalize(z_static, p=2, dim=-1)
+            z = clip_model.encode_text(tokenized).type(dtype)
+        z = F.normalize(z, p=2, dim=-1)
+        A_cos = z @ z.t()  # [-1,1] approx
 
-        A_raw = z_static @ z_static.t()
+        # Always build 0-1 version (方案A基线)
+        A01 = ((A_cos + 1.0) / 2.0).clamp(0.0, 1.0)
+        self.register_buffer("A_clip_01", A01)
 
-        # write-fixed ranges (label definition)
-        phase_range = slice(0, 7)
-        view_range = slice(7, 10)
-        action_range = slice(10, self.n_cls)
-        ranges = [(0, 7), (7, 10), (10, self.n_cls)]
+        # Always keep BOTH baselines for debugging/ablation
+        self.register_buffer("A_star_cos", self._postprocess_cos(A_cos))
+        self.register_buffer("A_star_01", self._postprocess_01(A01))
 
-        # mutual-exclusive within each big group (same)
-        structure_mask = torch.ones_like(A_raw, dtype=torch.bool)
-        structure_mask[phase_range, phase_range] = False
-        structure_mask[view_range, view_range] = False
-        structure_mask[action_range, action_range] = False
-        structure_mask.fill_diagonal_(True)
-
-        A_masked = A_raw * structure_mask.float()
-
-        # block-wise max norm (same)
-        A_norm = torch.zeros_like(A_masked)
-        for src_start, src_end in ranges:
-            for tgt_start, tgt_end in ranges:
-                block = A_masked[src_start:src_end, tgt_start:tgt_end]
-                if block.sum() == 0:
-                    continue
-                block = torch.where(block > sim_threshold, block, torch.zeros_like(block))
-                block_max, _ = block.max(dim=1, keepdim=True)
-                A_norm[src_start:src_end, tgt_start:tgt_end] = block / (block_max + 1e-12)
-
-        # self-loop (same)
-        A_final = A_norm
-        diag = torch.eye(self.n_cls, dtype=torch.bool, device=A_raw.device)
-        A_final[diag] = 0.0
-        A_final = A_final * (1.0 - s_reweight)
-        A_final[diag] = s_reweight
-
-        # ============================================================
-        # NEW: enable 3-gate fusion ONLY when external_path is valid
-        # ============================================================
+        # ---- load external matrix for gate ----
         self.use_gate = False
         external_path = getattr(cfg, "SCP_EXTERNAL_MATRIX_PATH", None)
 
         if external_path and os.path.isfile(external_path):
             try:
-                external_matrix = np.load(external_path, allow_pickle=False)
+                ext_np = np.load(external_path, allow_pickle=False)
+                if isinstance(ext_np, np.lib.npyio.NpzFile):
+                    raise ValueError("expected .npy but got .npz")
+                ext = torch.as_tensor(ext_np, dtype=A01.dtype, device=A01.device)
+                if ext.shape != A01.shape:
+                    raise ValueError(f"shape mismatch: expected {A01.shape}, got {ext.shape}")
             except Exception as e:
-                logger.warning(f"SCP external matrix failed to load from {external_path}: {e}. Use original A_star.")
+                logger.warning(f"SCP external matrix failed: {e}. Gate disabled.")
             else:
-                if isinstance(external_matrix, np.lib.npyio.NpzFile):
-                    logger.warning(
-                        f"SCP external matrix expected .npy but got .npz at {external_path}. Use original A_star."
-                    )
-                else:
-                    ext = torch.as_tensor(external_matrix, dtype=A_final.dtype, device=A_final.device)
-                    if ext.shape != A_final.shape:
-                        logger.warning(
-                            f"SCP external matrix shape mismatch: expected {A_final.shape}, got {ext.shape}. "
-                            "Use original A_star."
-                        )
-                    else:
-                        # ext is strictly 0~1 (prob); structure it to align with SCP
-                        A_ext = self._structure_external_prob(
-                            ext=ext,
-                            phase_range=phase_range,
-                            view_range=view_range,
-                            action_range=action_range,
-                            ranges=ranges,
-                            diag=diag,
-                        )
+                ext = ext.clamp(0.0, 1.0)
+                ext = 0.5 * (ext + ext.t())
+                self.register_buffer("A_ext_01", ext)
 
-                        # store both graphs
-                        self.register_buffer("A_clip_star", A_final.clone())
-                        self.register_buffer("A_ext_star", A_ext)
+                init_beta = _cfg("SCP_GATE_INIT_BETA", -4.0)
+                self.beta_pv = nn.Parameter(torch.tensor(float(init_beta)))
+                self.beta_pa = nn.Parameter(torch.tensor(float(init_beta)))
+                self.beta_va = nn.Parameter(torch.tensor(float(init_beta)))
 
-                        # 3 learnable gates: init near 0 -> start ~ CLIP-only
-                        init_beta = _cfg("SCP_GATE_INIT_BETA", -4.0)  # sigmoid(-4)=0.018
-                        self.beta_pv = nn.Parameter(torch.tensor(float(init_beta)))
-                        self.beta_pa = nn.Parameter(torch.tensor(float(init_beta)))
-                        self.beta_va = nn.Parameter(torch.tensor(float(init_beta)))
-
-                        self.use_gate = True
-                        logger.info(f"SCP external matrix loaded from {external_path}. Enable 3-gate fusion.")
+                self.use_gate = True
+                logger.info("SCP gate enabled (0-1 fusion).")
         elif external_path:
-            logger.warning(f"SCP external matrix path not found: {external_path}. Use original A_star.")
+            logger.warning(f"SCP external matrix path not found: {external_path}. Gate disabled.")
 
-        # original behavior: fixed A_star buffer
+        # For legacy code that expects self.A_star when no gate:
         if not self.use_gate:
-            self.register_buffer("A_star", A_final)
+            if self.baseline_mode == "cos":
+                self.register_buffer("A_star", self.A_star_cos.clone())
+            else:
+                self.register_buffer("A_star", self.A_star_01.clone())
 
-    def _structure_external_prob(self, ext, phase_range, view_range, action_range, ranges, diag):
-        """
-        ext: (N,N) probability matrix strictly in [0,1].
-        Align it with SCP-style adjacency:
-          - symmetrize
-          - zero within-group edges
-          - block-wise row-max normalization
-          - same self-loop reweighting
-        """
-        P = ext.clone().clamp(0.0, 1.0)
-        P = 0.5 * (P + P.t())  # symmetrize co-occurrence
+    def _postprocess_cos(self, A_cos: torch.Tensor):
+        """你的原版：cosine域 + sim_threshold + block row-max + self-loop"""
+        pr, vr, ar = self.phase_range, self.view_range, self.action_range
+        ranges = self.ranges
 
-        # respect mutual exclusivity within each group
-        P[phase_range, phase_range] = 0.0
-        P[view_range, view_range] = 0.0
-        P[action_range, action_range] = 0.0
+        # 原版 structure_mask（组内互斥）
+        structure_mask = torch.ones_like(A_cos, dtype=torch.bool)
+        structure_mask[pr, pr] = False
+        structure_mask[vr, vr] = False
+        structure_mask[ar, ar] = False
+        structure_mask.fill_diagonal_(True)
 
-        # block-wise row-max norm
-        P_norm = torch.zeros_like(P)
-        for src_start, src_end in ranges:
-            for tgt_start, tgt_end in ranges:
-                block = P[src_start:src_end, tgt_start:tgt_end]
+        A_masked = A_cos * structure_mask.float()
+
+        A_norm = torch.zeros_like(A_masked)
+        for ss, se in ranges:
+            for ts, te in ranges:
+                block = A_masked[ss:se, ts:te]
                 if block.sum() == 0:
                     continue
+                block = torch.where(block > self.sim_threshold, block, torch.zeros_like(block))
                 block_max, _ = block.max(dim=1, keepdim=True)
-                P_norm[src_start:src_end, tgt_start:tgt_end] = block / (block_max + 1e-12)
+                A_norm[ss:se, ts:te] = block / (block_max + 1e-12)
 
-        # self-loop same as CLIP graph
-        P_norm[diag] = 0.0
-        P_norm = P_norm * (1.0 - self.s_reweight)
-        P_norm[diag] = self.s_reweight
-        return P_norm
+        diag = torch.eye(self.n_cls, dtype=torch.bool, device=A_cos.device)
+        A_norm[diag] = 0.0
+        A_norm = A_norm * (1.0 - self.s_reweight)
+        A_norm[diag] = self.s_reweight
+        return A_norm
+
+    def _postprocess_01(self, A01: torch.Tensor):
+        """方案A：0-1域 + SCP_SIM_THRESHOLD_01 + block row-max + self-loop（mask 在这里做）"""
+        pr, vr, ar = self.phase_range, self.view_range, self.action_range
+        ranges = self.ranges
+
+        A = A01.clone()
+
+        # 融合后/或clip-only：都在这里做“不可能关系”mask（组内互斥）
+        A[pr, pr] = 0.0
+        A[vr, vr] = 0.0
+        A[ar, ar] = 0.0
+
+        th01 = getattr(cfg, "SCP_SIM_THRESHOLD_01", (self.sim_threshold + 1.0) / 2.0)
+
+        A_norm = torch.zeros_like(A)
+        for ss, se in ranges:
+            for ts, te in ranges:
+                block = A[ss:se, ts:te]
+                if block.sum() == 0:
+                    continue
+                block = torch.where(block > th01, block, torch.zeros_like(block))
+                block_max, _ = block.max(dim=1, keepdim=True)
+                A_norm[ss:se, ts:te] = block / (block_max + 1e-12)
+
+        diag = torch.eye(self.n_cls, dtype=torch.bool, device=A.device)
+        A_norm[diag] = 0.0
+        A_norm = A_norm * (1.0 - self.s_reweight)
+        A_norm[diag] = self.s_reweight
+        return A_norm
 
     def forward(self):
-        # original behavior
+        # No gate: return selected baseline (and keep self.A_star for legacy)
         if not self.use_gate:
             return self.A_star
 
-        # gated fusion only on cross-group blocks
-        A = self.A_clip_star.clone()
-
-        phase_range = slice(0, 7)
-        view_range = slice(7, 10)
-        action_range = slice(10, self.n_cls)
+        # Gate: fuse on 0-1 then postprocess_01
+        A01 = self.A_clip_01
+        ext = self.A_ext_01
 
         w_pv = torch.sigmoid(self.beta_pv)
         w_pa = torch.sigmoid(self.beta_pa)
         w_va = torch.sigmoid(self.beta_va)
 
-        # pv + vp
-        A[phase_range, view_range] = (1 - w_pv) * self.A_clip_star[phase_range, view_range] + w_pv * self.A_ext_star[phase_range, view_range]
-        A[view_range, phase_range] = (1 - w_pv) * self.A_clip_star[view_range, phase_range] + w_pv * self.A_ext_star[view_range, phase_range]
+        pr, vr, ar = self.phase_range, self.view_range, self.action_range
 
-        # pa + ap
-        A[phase_range, action_range] = (1 - w_pa) * self.A_clip_star[phase_range, action_range] + w_pa * self.A_ext_star[phase_range, action_range]
-        A[action_range, phase_range] = (1 - w_pa) * self.A_clip_star[action_range, phase_range] + w_pa * self.A_ext_star[action_range, phase_range]
+        A_fused = A01.clone()
 
-        # va + av
-        A[view_range, action_range] = (1 - w_va) * self.A_clip_star[view_range, action_range] + w_va * self.A_ext_star[view_range, action_range]
-        A[action_range, view_range] = (1 - w_va) * self.A_clip_star[action_range, view_range] + w_va * self.A_ext_star[action_range, view_range]
+        # pv/vp
+        A_fused[pr, vr] = (1 - w_pv) * A01[pr, vr] + w_pv * ext[pr, vr]
+        A_fused[vr, pr] = (1 - w_pv) * A01[vr, pr] + w_pv * ext[vr, pr]
+        # pa/ap
+        A_fused[pr, ar] = (1 - w_pa) * A01[pr, ar] + w_pa * ext[pr, ar]
+        A_fused[ar, pr] = (1 - w_pa) * A01[ar, pr] + w_pa * ext[ar, pr]
+        # va/av
+        A_fused[vr, ar] = (1 - w_va) * A01[vr, ar] + w_va * ext[vr, ar]
+        A_fused[ar, vr] = (1 - w_va) * A01[ar, vr] + w_va * ext[ar, vr]
 
-        return A
+        A_fused = A_fused.clamp(0.0, 1.0)
+        # 可选：更稳（避免数值微小不对称）
+        A_fused = 0.5 * (A_fused + A_fused.t())
+
+        return self._postprocess_01(A_fused)
 
     @torch.no_grad()
     def gate_weights(self):
