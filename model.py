@@ -747,40 +747,68 @@ class HSPNet(nn.Module):
 # SCPNet (minimal cfg, no garbage)
 # ======================================================================
 class StructuredPriorPrompter(nn.Module):
+    """
+    SPP: build label-relation matrix A* from CLIP text encoder similarities,
+    optionally fuse with an external matrix via a learnable gate.
+
+    ✅ 新增（你要的）：
+      - cfg.SCP_USE_RAW_RELATION = True 时，直接返回“文本编码器生成的最原始相似度矩阵”
+        不做任何 mask / threshold / block-normalize / self-loop 重写
+      - cfg.SCP_RAW_RELATION_MODE = "cos" 或 "01"
+        "cos": A_cos = z @ z.t()  (≈[-1,1])
+        "01" : A01  = (A_cos+1)/2 (∈[0,1])
+
+    （可选）也保留了组内互斥/组间共现 mask 的开关，便于消融：
+      - cfg.SCP_ENABLE_INTRA_MUTEX_MASK (default True)
+      - cfg.SCP_ENABLE_INTER_COOCCUR_MASK (default True)
+    """
+
     def __init__(self, classnames, clip_model):
         super().__init__()
 
         self.s_reweight = _cfg("SCP_S_REWEIGHT", _cfg("reweight_p", 0.2))
         self.sim_threshold = _cfg("SCP_SIM_THRESHOLD", _cfg("sim_threshold", 0.05))
-        self.baseline_mode = getattr(cfg, "SCP_BASELINE_MODE", "01")  # "01" (方案A默认) or "cos"
+        self.baseline_mode = getattr(cfg, "SCP_BASELINE_MODE", "01")  # "01" or "cos"
+
+        # optional ablation switches (default keep your current behavior)
+        self.enable_intra_mutex = _cfg("SCP_ENABLE_INTRA_MUTEX_MASK", True)
+        self.enable_inter_cooccur = _cfg("SCP_ENABLE_INTER_COOCCUR_MASK", True)
 
         if hasattr(cfg, "child_num") and cfg.child_num > 0:
             classnames = classnames[0 : cfg.child_num]
         self.n_cls = len(classnames)
         dtype = clip_model.dtype
 
-        # ranges
+        # ranges (fixed protocol)
         self.phase_range = slice(0, 7)
         self.view_range = slice(7, 10)
         self.action_range = slice(10, self.n_cls)
         self.ranges = [(0, 7), (7, 10), (10, self.n_cls)]
 
-        # ---- CLIP text similarity (cosine) ----
+        # ---- CLIP text similarity (raw) ----
         template = "a photo of a {}."
         classnames_proc = [n.replace("_", " ") for n in classnames]
         prompts = [template.format(n) for n in classnames_proc]
         tokenized = torch.cat([clip.tokenize(p) for p in prompts])
 
+        # make device-safe (won't change values, only avoids device mismatch)
+        try:
+            dev = next(clip_model.parameters()).device
+            tokenized = tokenized.to(dev)
+        except Exception:
+            pass
+
         with torch.no_grad():
             z = clip_model.encode_text(tokenized).type(dtype)
         z = F.normalize(z, p=2, dim=-1)
-        A_cos = z @ z.t()  # [-1,1] approx
 
-        # Always build 0-1 version (方案A基线)
-        A01 = ((A_cos + 1.0) / 2.0).clamp(0.0, 1.0)
+        A_cos = z @ z.t()  # raw cosine sim, approx [-1, 1]
+        self.register_buffer("A_clip_cos", A_cos)
+
+        A01 = ((A_cos + 1.0) / 2.0).clamp(0.0, 1.0)  # simple mapping to [0,1]
         self.register_buffer("A_clip_01", A01)
 
-        # Always keep BOTH baselines for debugging/ablation
+        # Always keep BOTH processed baselines for debugging/ablation
         self.register_buffer("A_star_cos", self._postprocess_cos(A_cos))
         self.register_buffer("A_star_01", self._postprocess_01(A01))
 
@@ -800,7 +828,7 @@ class StructuredPriorPrompter(nn.Module):
                 logger.warning(f"SCP external matrix failed: {e}. Gate disabled.")
             else:
                 ext = ext.clamp(0.0, 1.0)
-                ext = 0.5 * (ext + ext.t())
+                ext = 0.5 * (ext + ext.t())  # symmetrize
                 self.register_buffer("A_ext_01", ext)
 
                 init_beta = _cfg("SCP_GATE_INIT_BETA", -4.0)
@@ -813,7 +841,7 @@ class StructuredPriorPrompter(nn.Module):
         elif external_path:
             logger.warning(f"SCP external matrix path not found: {external_path}. Gate disabled.")
 
-        # For legacy code that expects self.A_star when no gate:
+        # For legacy code that expects self.A_star when no gate
         if not self.use_gate:
             if self.baseline_mode == "cos":
                 self.register_buffer("A_star", self.A_star_cos.clone())
@@ -821,19 +849,34 @@ class StructuredPriorPrompter(nn.Module):
                 self.register_buffer("A_star", self.A_star_01.clone())
 
     def _postprocess_cos(self, A_cos: torch.Tensor):
-        """你的原版：cosine域 + sim_threshold + block row-max + self-loop"""
+        """cosine域 + (可选mask) + sim_threshold + block row-max + self-loop"""
         pr, vr, ar = self.phase_range, self.view_range, self.action_range
         ranges = self.ranges
 
-        # 原版 structure_mask（组内互斥）
+        # ===== mask（可控）=====
         structure_mask = torch.ones_like(A_cos, dtype=torch.bool)
-        structure_mask[pr, pr] = False
-        structure_mask[vr, vr] = False
-        structure_mask[ar, ar] = False
+
+        # 1) 大类内互斥（组内置零）
+        if self.enable_intra_mutex:
+            structure_mask[pr, pr] = False
+            structure_mask[vr, vr] = False
+            structure_mask[ar, ar] = False
+
+        # 2) 大类间共现（跨组保留/屏蔽）
+        if not self.enable_inter_cooccur:
+            structure_mask[pr, vr] = False
+            structure_mask[vr, pr] = False
+            structure_mask[pr, ar] = False
+            structure_mask[ar, pr] = False
+            structure_mask[vr, ar] = False
+            structure_mask[ar, vr] = False
+
+        # 对角线先放行（后面会被 s_reweight 重写）
         structure_mask.fill_diagonal_(True)
 
         A_masked = A_cos * structure_mask.float()
 
+        # ===== 原逻辑：block 内 row-max 归一 =====
         A_norm = torch.zeros_like(A_masked)
         for ss, se in ranges:
             for ts, te in ranges:
@@ -844,6 +887,7 @@ class StructuredPriorPrompter(nn.Module):
                 block_max, _ = block.max(dim=1, keepdim=True)
                 A_norm[ss:se, ts:te] = block / (block_max + 1e-12)
 
+        # self-loop reweight
         diag = torch.eye(self.n_cls, dtype=torch.bool, device=A_cos.device)
         A_norm[diag] = 0.0
         A_norm = A_norm * (1.0 - self.s_reweight)
@@ -851,16 +895,26 @@ class StructuredPriorPrompter(nn.Module):
         return A_norm
 
     def _postprocess_01(self, A01: torch.Tensor):
-        """方案A：0-1域 + SCP_SIM_THRESHOLD_01 + block row-max + self-loop（mask 在这里做）"""
+        """0-1域 + (可选mask) + threshold_01 + block row-max + self-loop"""
         pr, vr, ar = self.phase_range, self.view_range, self.action_range
         ranges = self.ranges
 
         A = A01.clone()
 
-        # 融合后/或clip-only：都在这里做“不可能关系”mask（组内互斥）
-        A[pr, pr] = 0.0
-        A[vr, vr] = 0.0
-        A[ar, ar] = 0.0
+        # 1) 大类内互斥
+        if self.enable_intra_mutex:
+            A[pr, pr] = 0.0
+            A[vr, vr] = 0.0
+            A[ar, ar] = 0.0
+
+        # 2) 大类间共现（False=跨组全置零）
+        if not self.enable_inter_cooccur:
+            A[pr, vr] = 0.0
+            A[vr, pr] = 0.0
+            A[pr, ar] = 0.0
+            A[ar, pr] = 0.0
+            A[vr, ar] = 0.0
+            A[ar, vr] = 0.0
 
         th01 = getattr(cfg, "SCP_SIM_THRESHOLD_01", (self.sim_threshold + 1.0) / 2.0)
 
@@ -881,6 +935,11 @@ class StructuredPriorPrompter(nn.Module):
         return A_norm
 
     def forward(self):
+        # ✅ 你要的：直接返回最原始的“文本编码器相似度矩阵”，完全不mask/不归一/不重写self-loop
+        if _cfg("SCP_USE_RAW_RELATION", False):
+            mode = _cfg("SCP_RAW_RELATION_MODE", "cos")  # "cos" or "01"
+            return self.A_clip_cos if mode == "cos" else self.A_clip_01
+
         # No gate: return selected baseline (and keep self.A_star for legacy)
         if not self.use_gate:
             return self.A_star
@@ -908,8 +967,7 @@ class StructuredPriorPrompter(nn.Module):
         A_fused[ar, vr] = (1 - w_va) * A01[ar, vr] + w_va * ext[ar, vr]
 
         A_fused = A_fused.clamp(0.0, 1.0)
-        # 可选：更稳（避免数值微小不对称）
-        A_fused = 0.5 * (A_fused + A_fused.t())
+        A_fused = 0.5 * (A_fused + A_fused.t())  # keep symmetric
 
         return self._postprocess_01(A_fused)
 
