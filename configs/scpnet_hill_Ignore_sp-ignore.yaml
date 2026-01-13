@@ -3,8 +3,8 @@ n_ctx: 4
 checkpoint: cholec_vals/scpnet_hill_Ignore_sp-ignore    # For saving checkpoints
 log_file: scpnet_hill_Ignore_sp-ignore.txt
 model_name: scpnet
-batch_size: 20
-accumulation_steps: 2
+batch_size: 32
+accumulation_steps: 1
 lr: 3e-5
 epochs: 10
 reweight_p: 0.2
