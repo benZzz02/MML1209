@@ -48,7 +48,7 @@ test_dir: trial_test_scpnet_hill_Ignore_sp # Directory to save results
 test_loss: Hill_Ignore  # Loss function
 
 gcn_layers: 3
-sim_threshold: 0.05
+sim_threshold: 0.5
 SCP_TOPK_K: 1
 SCP_COMP_ALPHA: 2.0
 SCP_COMP_TEMP: 1.0
@@ -57,7 +57,10 @@ SCP_ENABLE_LOGIT_COMP: True
 SCP_ENABLE_IGNORE_MASK: True
 debug: True
 debug_step: 200
-SCP_EXTERNAL_MATRIX_PATH: matrix.npy
-SCP_EXTERNAL_MATRIX_THRESHOLD: 0.5
-SCP_SIM_THRESHOLD_01: 0.5
-SCP_BASELINE_MODE: "01"   # 或 "cos","01"
+#SCP_EXTERNAL_MATRIX_PATH: matrix.npy
+#SCP_EXTERNAL_MATRIX_THRESHOLD: 0.1
+#SCP_SIM_THRESHOLD_01: 0.5
+SCP_BASELINE_MODE: "cos"   # 或 "cos","01"
+SCP_SAVE_RELATION_PATH: "text_relation.npy"
+SCP_SAVE_RELATION_JSON_PATH: "text_relation_json.json"
+SCP_SAVE_RELATION_MODE: "cos"
