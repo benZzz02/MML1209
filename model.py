@@ -749,7 +749,7 @@ class HSPNet(nn.Module):
 class StructuredPriorPrompter(nn.Module):
     """
     SPP: build label-relation matrix A* from CLIP text encoder similarities,
-    optionally fuse with an external matrix via a learnable gate.
+    optionally fuse with an external matrix via a fixed threshold.
 
     ✅ 新增（你要的）：
       - cfg.SCP_USE_RAW_RELATION = True 时，直接返回“文本编码器生成的最原始相似度矩阵”
@@ -812,9 +812,10 @@ class StructuredPriorPrompter(nn.Module):
         self.register_buffer("A_star_cos", self._postprocess_cos(A_cos))
         self.register_buffer("A_star_01", self._postprocess_01(A01))
 
-        # ---- load external matrix for gate ----
+        # ---- load external matrix for thresholded fusion ----
         self.use_gate = False
         external_path = getattr(cfg, "SCP_EXTERNAL_MATRIX_PATH", None)
+        self.ext_threshold = _cfg("SCP_EXTERNAL_MATRIX_THRESHOLD", 0.5)
 
         if external_path and os.path.isfile(external_path):
             try:
@@ -825,21 +826,18 @@ class StructuredPriorPrompter(nn.Module):
                 if ext.shape != A01.shape:
                     raise ValueError(f"shape mismatch: expected {A01.shape}, got {ext.shape}")
             except Exception as e:
-                logger.warning(f"SCP external matrix failed: {e}. Gate disabled.")
+                logger.warning(f"SCP external matrix failed: {e}. Threshold fusion disabled.")
             else:
                 ext = ext.clamp(0.0, 1.0)
                 ext = 0.5 * (ext + ext.t())  # symmetrize
                 self.register_buffer("A_ext_01", ext)
-
-                init_beta = _cfg("SCP_GATE_INIT_BETA", -4.0)
-                self.beta_pv = nn.Parameter(torch.tensor(float(init_beta)))
-                self.beta_pa = nn.Parameter(torch.tensor(float(init_beta)))
-                self.beta_va = nn.Parameter(torch.tensor(float(init_beta)))
-
                 self.use_gate = True
-                logger.info("SCP gate enabled (0-1 fusion).")
+                logger.info(
+                    "SCP external matrix enabled (threshold fusion, threshold=%.3f).",
+                    self.ext_threshold,
+                )
         elif external_path:
-            logger.warning(f"SCP external matrix path not found: {external_path}. Gate disabled.")
+            logger.warning(f"SCP external matrix path not found: {external_path}. Threshold fusion disabled.")
 
         # For legacy code that expects self.A_star when no gate
         if not self.use_gate:
@@ -944,28 +942,11 @@ class StructuredPriorPrompter(nn.Module):
         if not self.use_gate:
             return self.A_star
 
-        # Gate: fuse on 0-1 then postprocess_01
+        # Threshold fusion on 0-1 then postprocess_01
         A01 = self.A_clip_01
         ext = self.A_ext_01
-
-        w_pv = torch.sigmoid(self.beta_pv)
-        w_pa = torch.sigmoid(self.beta_pa)
-        w_va = torch.sigmoid(self.beta_va)
-
-        pr, vr, ar = self.phase_range, self.view_range, self.action_range
-
-        A_fused = A01.clone()
-
-        # pv/vp
-        A_fused[pr, vr] = (1 - w_pv) * A01[pr, vr] + w_pv * ext[pr, vr]
-        A_fused[vr, pr] = (1 - w_pv) * A01[vr, pr] + w_pv * ext[vr, pr]
-        # pa/ap
-        A_fused[pr, ar] = (1 - w_pa) * A01[pr, ar] + w_pa * ext[pr, ar]
-        A_fused[ar, pr] = (1 - w_pa) * A01[ar, pr] + w_pa * ext[ar, pr]
-        # va/av
-        A_fused[vr, ar] = (1 - w_va) * A01[vr, ar] + w_va * ext[vr, ar]
-        A_fused[ar, vr] = (1 - w_va) * A01[ar, vr] + w_va * ext[ar, vr]
-
+        mask = ext >= self.ext_threshold
+        A_fused = torch.where(mask, ext, A01)
         A_fused = A_fused.clamp(0.0, 1.0)
         A_fused = 0.5 * (A_fused + A_fused.t())  # keep symmetric
 
@@ -975,12 +956,7 @@ class StructuredPriorPrompter(nn.Module):
     def gate_weights(self):
         if not self.use_gate:
             return {"use_gate": False}
-        return {
-            "use_gate": True,
-            "w_pv": float(torch.sigmoid(self.beta_pv).item()),
-            "w_pa": float(torch.sigmoid(self.beta_pa).item()),
-            "w_va": float(torch.sigmoid(self.beta_va).item()),
-        }
+        return {"use_gate": True, "threshold": float(self.ext_threshold)}
 
 
 class SemanticAssociationModule(nn.Module):
@@ -1125,7 +1101,7 @@ class MMLSurgAdaptSCPNet(nn.Module):
         logits = 10.0 * image_features @ text_features_refined.t()
 
         # ===== switches (same as your version) =====
-        use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True)
+        use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True) and (not self.training)
         use_ignore = _cfg("SCP_ENABLE_IGNORE_MASK", True)
 
         ignore_neg_mask = None
