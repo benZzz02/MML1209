@@ -1,5 +1,6 @@
 # model.py
 from collections import OrderedDict
+import json
 import os
 import math
 import numpy as np
@@ -807,6 +808,23 @@ class StructuredPriorPrompter(nn.Module):
 
         A01 = ((A_cos + 1.0) / 2.0).clamp(0.0, 1.0)  # simple mapping to [0,1]
         self.register_buffer("A_clip_01", A01)
+
+        save_path = _cfg("SCP_SAVE_RELATION_PATH", None)
+        save_json_path = _cfg("SCP_SAVE_RELATION_JSON_PATH", None)
+        save_mode = _cfg("SCP_SAVE_RELATION_MODE", "cos")  # "cos" or "01"
+        if save_path or save_json_path:
+            try:
+                mat = self.A_clip_cos if save_mode == "cos" else self.A_clip_01
+                mat_np = mat.detach().cpu().numpy()
+                if save_path:
+                    np.save(save_path, mat_np)
+                    logger.info(f"SCP relation matrix saved to {save_path} (mode={save_mode}).")
+                if save_json_path:
+                    with open(save_json_path, "w", encoding="utf-8") as f:
+                        json.dump(mat_np.tolist(), f)
+                    logger.info(f"SCP relation matrix saved to {save_json_path} (mode={save_mode}).")
+            except Exception as e:
+                logger.warning(f"SCP relation matrix save failed: {e}")
 
         # Always keep BOTH processed baselines for debugging/ablation
         self.register_buffer("A_star_cos", self._postprocess_cos(A_cos))
