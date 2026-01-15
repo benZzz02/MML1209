@@ -60,7 +60,7 @@ SCP_ENABLE_INTRA_MUTEX_MASK: True
 SCP_ENABLE_INTER_COOCCUR_MASK: True
 debug: True
 debug_step: 200
-SCP_EXTERNAL_MATRIX_PATH: text_matrix.npy
+SCP_EXTERNAL_MATRIX_PATH: surgical_cooccurrence_matrix.npy
 SCP_EXTERNAL_FUSE_LAMBDA: 0.3
 
 
