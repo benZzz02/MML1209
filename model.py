@@ -1,6 +1,5 @@
 # model.py
 from collections import OrderedDict
-import json
 import os
 import math
 import numpy as np
@@ -745,7 +744,7 @@ class HSPNet(nn.Module):
 
 
 # ======================================================================
-# SCPNet (minimal cfg, no garbage)
+# SCPNet (cos-only + external fusion by lambda; no use_gate; no 01 branch; no block row-max)
 # ======================================================================
 class StructuredPriorPrompter(nn.Module):
     """
@@ -754,6 +753,7 @@ class StructuredPriorPrompter(nn.Module):
       - If external matrix provided: A_fused = (1-lam)*A_clip_cos + lam*A_ext_cos
       - Postprocess: (optional) intra-mutex mask + (optional) inter-cooccur mask
                     + sim_threshold + block row-max norm + self-loop(s_reweight)
+      - Save raw CLIP text relation matrix (A_clip_cos) to npy/json if paths provided.
     """
 
     def __init__(self, classnames, clip_model):
@@ -762,7 +762,7 @@ class StructuredPriorPrompter(nn.Module):
         self.s_reweight = _cfg("SCP_S_REWEIGHT", _cfg("reweight_p", 0.2))
         self.sim_threshold = _cfg("SCP_SIM_THRESHOLD", _cfg("sim_threshold", 0.05))
 
-        # keep these two because they directly control the structure you asked about
+        # structure switches (directly relevant)
         self.enable_intra_mutex = _cfg("SCP_ENABLE_INTRA_MUTEX_MASK", True)
         self.enable_inter_cooccur = _cfg("SCP_ENABLE_INTER_COOCCUR_MASK", True)
 
@@ -796,6 +796,22 @@ class StructuredPriorPrompter(nn.Module):
 
         A_cos = z @ z.t()  # ≈[-1,1]
         self.register_buffer("A_clip_cos", A_cos)
+
+        # ---- SAVE raw CLIP text relation matrix (A_clip_cos) ----
+        save_path = _cfg("SCP_SAVE_RELATION_PATH", None)
+        save_json_path = _cfg("SCP_SAVE_RELATION_JSON_PATH", None)
+        if save_path or save_json_path:
+            try:
+                mat_np = self.A_clip_cos.detach().cpu().numpy()
+                if save_path:
+                    np.save(save_path, mat_np)
+                    logger.info(f"SCP relation matrix saved to {save_path} (cos).")
+                if save_json_path:
+                    with open(save_json_path, "w", encoding="utf-8") as f:
+                        json.dump(mat_np.tolist(), f)
+                    logger.info(f"SCP relation matrix saved to {save_json_path} (cos).")
+            except Exception as e:
+                logger.warning(f"SCP relation matrix save failed: {e}")
 
         # ---- external fusion (weighted) ----
         self.use_gate = False  # keep name for compatibility with your current MMLSurgAdaptSCPNet
@@ -873,7 +889,7 @@ class StructuredPriorPrompter(nn.Module):
         return A_norm
 
     def forward(self):
-        # no external: fixed A_star (same behavior style as before)
+        # no external: fixed A_star
         if not self.use_gate:
             return self.A_star
 
@@ -988,13 +1004,8 @@ class MMLSurgAdaptSCPNet(nn.Module):
         self.prompt_learner = PromptLearner(classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
 
-        # Structured prior prompter (may or may not use gate)
+        # always returns final A_star (with/without external fusion)
         self.spp = StructuredPriorPrompter(classnames, clip_model)
-        self.use_gate = getattr(self.spp, "use_gate", False)
-
-        # Keep EXACT original behavior when no external -> register fixed A_star buffer
-        if not self.use_gate:
-            self.register_buffer("A_star", self.spp())
 
         try:
             feat_dim = clip_model.text_projection.shape[1]
@@ -1015,8 +1026,8 @@ class MMLSurgAdaptSCPNet(nn.Module):
         child_prompts = self.prompt_learner()
         Z = self.text_encoder(child_prompts, self.tokenized_prompts)
 
-        # choose A_star: dynamic when gate enabled; fixed buffer otherwise (original)
-        A_star = self.spp() if self.use_gate else self.A_star
+        # final structured prior
+        A_star = self.spp()
 
         # GCN needs row-sum normalized adjacency
         row_sum = A_star.sum(dim=1, keepdim=True)
@@ -1027,7 +1038,7 @@ class MMLSurgAdaptSCPNet(nn.Module):
 
         logits = 10.0 * image_features @ text_features_refined.t()
 
-        # ===== switches (same as your version) =====
+        # ===== switches =====
         use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True) and (not self.training)
         use_ignore = _cfg("SCP_ENABLE_IGNORE_MASK", True)
 
