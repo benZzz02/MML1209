@@ -56,7 +56,7 @@ SCP_TOPK_USE_SIGMOID: True
 SCP_ENABLE_LOGIT_COMP: True
 SCP_ENABLE_IGNORE_MASK: False
 debug: True
-debug_step: 200
+debug_step: 200ssss
 SCP_EXTERNAL_MATRIX_PATH: matrix.npy
 SCP_GATE_INIT_BETA: -2.0
 SCP_LOG_GATE: True
