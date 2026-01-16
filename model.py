@@ -1039,7 +1039,7 @@ class MMLSurgAdaptSCPNet(nn.Module):
         logits = 10.0 * image_features @ text_features_refined.t()
 
         # ===== switches =====
-        use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True) and (not self.training)
+        use_comp = _cfg("SCP_ENABLE_LOGIT_COMP", True)
         use_ignore = _cfg("SCP_ENABLE_IGNORE_MASK", True)
 
         ignore_neg_mask = None
