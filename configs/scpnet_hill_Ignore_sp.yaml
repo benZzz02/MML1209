@@ -50,7 +50,7 @@ test_loss: Hill_Ignore  # Loss function
 gcn_layers: 3
 sim_threshold: 0.3
 SCP_TOPK_K: 1
-SCP_COMP_ALPHA: 1.0
+SCP_COMP_ALPHA: 1.5
 SCP_COMP_TEMP: 1.0
 SCP_TOPK_USE_SIGMOID: True
 SCP_ENABLE_LOGIT_COMP: True

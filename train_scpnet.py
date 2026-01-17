@@ -944,9 +944,12 @@ def test(trainer, dir, checkpoint_paths=None, run=None) -> None:
     sigmoid = torch.sigmoid
     processed_epochs = set()
 
-    for ckpt_path in target_paths:
+    log_full = getattr(cfg, "log_full_metrics", False)  # 可选：默认不爆炸式记录
+
+    for idx, ckpt_path in enumerate(target_paths):
         if not os.path.exists(ckpt_path):
             continue
+
         filename = os.path.basename(ckpt_path)
         epoch_id = "unknown"
         try:
@@ -968,7 +971,7 @@ def test(trainer, dir, checkpoint_paths=None, run=None) -> None:
         model_to_run.eval()
 
         preds, targets, all_vids = [], [], []
-        for i, (input, target, vid) in enumerate(trainer.test_loader):
+        for _, (input, target, vid) in enumerate(trainer.test_loader):
             target = target.cuda(non_blocking=True)
             input = input.cuda(non_blocking=True)
             with torch.no_grad():
@@ -987,18 +990,39 @@ def test(trainer, dir, checkpoint_paths=None, run=None) -> None:
         a, b, c = calculate_metrics(all_labels, all_predictions, all_predictions, all_vids_np, True, dir, method=method_name)
 
         # ✅ SwanLab test log
-        if is_main_process() and run is not None and a and b and c:
-            step_id = int(epoch_id) if str(epoch_id).isdigit() else 0
-            swanlab.log({
-                "test/cholec80_f1": float(a[0]),
-                "test/endo_mAP": float(b[0]),
-                "test/cholect50_AP_ivt": float(c[0].get("AP_ivt", 0.0)) if isinstance(c[0], dict) else 0.0,
-                "test/ckpt_name": method_name,
-            }, step=int(step_id))
+        if is_main_process() and run is not None and (a is not None) and (b is not None) and (c is not None):
+            # step 用 idx，避免冲突；epoch 另存字段
+            step_id = int(idx)
+            epoch_num = int(epoch_id) if str(epoch_id).isdigit() else -1
+
+            payload = {
+                "test/epoch": epoch_num,
+                "test/cholec80/F1_score": float(a[0]),
+                "test/endoscapes/mAP": float(b[0]),
+                "test/ckpt_name": swanlab.Text(filename, caption="checkpoint filename"),
+            }
+
+            # --- CholecT50: AP 全量 ---
+            if isinstance(c[0], dict):
+                for k, v in c[0].items():
+                    payload[f"test/cholect50/{k}"] = float(v)
+
+            # --- Endoscapes: per-class mAP ---
+            if isinstance(b[2], dict):
+                for cls, apv in b[2].items():
+                    payload[f"test/endoscapes/per_class/{cls}"] = float(apv)
+
+            # --- Cholec80: per-video f1（默认关，避免爆）---
+            if log_full and isinstance(a[2], dict):
+                for vid, f1v in a[2].items():
+                    payload[f"test/cholec80/per_video_f1/{vid}"] = float(f1v)
+
+            swanlab.log(payload, step=step_id)
 
         pr_data = compute_pr_sidecar(all_labels, all_predictions, all_vids_np, pr_targets=(0.3, 0.5, 0.7, 0.8), max_points=20000)
         merged_path = merge_pr_points_into_result_json(pr_data, dir, test=True)
         save_pr_npz_and_png(pr_data, dir, test=True, result_json_path=merged_path)
+
         processed_epochs.add(epoch_id)
         logger.info(f"Finished testing {method_name}")
 
