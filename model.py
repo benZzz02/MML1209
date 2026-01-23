@@ -855,8 +855,8 @@ class StructuredPriorPrompter(nn.Module):
         # intra-group mutex
         if self.enable_intra_mutex:
             structure_mask[pr, pr] = False
-            structure_mask[vr, vr] = False
-            structure_mask[ar, ar] = False
+            structure_mask[vr, vr] = True
+            structure_mask[ar, ar] = True
 
         # inter-group cooccur
         if not self.enable_inter_cooccur:
@@ -879,7 +879,9 @@ class StructuredPriorPrompter(nn.Module):
                     continue
                 block = torch.where(block > self.sim_threshold, block, torch.zeros_like(block))
                 block_max, _ = block.max(dim=1, keepdim=True)
-                A_norm[ss:se, ts:te] = block / (block_max + 1e-12)
+                r = block / (block_max + 1e-12)
+                r = r.pow(_cfg("SCP_BLOCK_GAMMA", 1.5))   # 1.0=原版；1.5~2.0更尖锐
+                A_norm[ss:se, ts:te] = r
 
         # self-loop rewrite
         diag = torch.eye(self.n_cls, dtype=torch.bool, device=A_cos.device)
