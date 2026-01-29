@@ -855,8 +855,8 @@ class StructuredPriorPrompter(nn.Module):
         # intra-group mutex
         if self.enable_intra_mutex:
             structure_mask[pr, pr] = False
-            structure_mask[vr, vr] = True
-            structure_mask[ar, ar] = True
+            structure_mask[vr, vr] = False
+            structure_mask[ar, ar] = False
 
         # inter-group cooccur
         if not self.enable_inter_cooccur:

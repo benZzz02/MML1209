@@ -48,20 +48,20 @@ test_dir: trial_test_scpnet_hill_Ignore_sp # Directory to save results
 test_loss: Hill_Ignore  # Loss function
 
 gcn_layers: 3
-sim_threshold: 0.3
+sim_threshold: 0.05
 SCP_TOPK_K: 1
 SCP_COMP_ALPHA: 2.0
-SCP_COMP_TEMP: 1.2
+SCP_COMP_TEMP: 0.8
 SCP_TOPK_USE_SIGMOID: True
 SCP_ENABLE_LOGIT_COMP: True
 SCP_ENABLE_IGNORE_MASK: True
 SCP_ENABLE_INTRA_MUTEX_MASK: True
-SCP_BLOCK_GAMMA: 1.1
+SCP_BLOCK_GAMMA: 1.0
 SCP_ENABLE_INTER_COOCCUR_MASK: True
 debug: True
 debug_step: 200
 SCP_EXTERNAL_MATRIX_PATH: surgical_matrix_zeroshot.npy
-SCP_EXTERNAL_FUSE_LAMBDA: 0.3
+SCP_EXTERNAL_FUSE_LAMBDA: 0.2
 
 
 SCP_SAVE_RELATION_PATH: "text_relation.npy"
