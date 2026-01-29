@@ -817,30 +817,51 @@ class StructuredPriorPrompter(nn.Module):
         self.use_gate = False  # keep name for compatibility with your current MMLSurgAdaptSCPNet
         self.fuse_lam = float(_cfg("SCP_EXTERNAL_FUSE_LAMBDA", 0.5))  # 0..1
 
-        external_path = getattr(cfg, "SCP_EXTERNAL_MATRIX_PATH", None)
-        if external_path and os.path.isfile(external_path):
+        external_paths = getattr(cfg, "SCP_EXTERNAL_MATRIX_PATHS", None)
+        external_lams = getattr(cfg, "SCP_EXTERNAL_FUSE_LAMBDAS", None)
+        if external_paths:
+            if not isinstance(external_paths, (list, tuple)):
+                external_paths = [external_paths]
+            if external_lams is None:
+                external_lams = [self.fuse_lam] * len(external_paths)
+            elif not isinstance(external_lams, (list, tuple)):
+                external_lams = [external_lams]
+        else:
+            external_paths = [getattr(cfg, "SCP_EXTERNAL_MATRIX_PATH", None)]
+            external_lams = [self.fuse_lam]
+
+        ext_mats = []
+        ext_lams = []
+        for path, lam in zip(external_paths, external_lams):
+            if not path:
+                continue
+            if not os.path.isfile(path):
+                logger.warning(f"SCP external matrix path not found: {path}. External fusion skipped.")
+                continue
             try:
-                ext_np = np.load(external_path, allow_pickle=False)
+                ext_np = np.load(path, allow_pickle=False)
                 if isinstance(ext_np, np.lib.npyio.NpzFile):
                     raise ValueError("expected .npy but got .npz")
                 ext = torch.as_tensor(ext_np, dtype=A_cos.dtype, device=A_cos.device)
                 if ext.shape != A_cos.shape:
                     raise ValueError(f"shape mismatch: expected {A_cos.shape}, got {ext.shape}")
             except Exception as e:
-                logger.warning(f"SCP external matrix load failed: {e}. External fusion disabled.")
-            else:
-                # symmetrize + clamp to cosine range (assume ext is cosine-like)
-                ext = 0.5 * (ext + ext.t())
-                ext = ext.clamp(-1.0, 1.0)
-                self.register_buffer("A_ext_cos", ext)
-                self.use_gate = True
-                logger.info(
-                    "SCP external fusion enabled (weighted): lam=%.3f, path=%s",
-                    float(self.fuse_lam),
-                    str(external_path),
-                )
-        elif external_path:
-            logger.warning(f"SCP external matrix path not found: {external_path}. External fusion disabled.")
+                logger.warning(f"SCP external matrix load failed: {e}. External fusion skipped.")
+                continue
+            # symmetrize + clamp to cosine range (assume ext is cosine-like)
+            ext = 0.5 * (ext + ext.t())
+            ext = ext.clamp(-1.0, 1.0)
+            ext_mats.append(ext)
+            ext_lams.append(float(lam))
+            logger.info("SCP external fusion source loaded: lam=%.3f, path=%s", float(lam), str(path))
+
+        if ext_mats:
+            self.register_buffer("A_ext_cos_stack", torch.stack(ext_mats, dim=0))
+            self.ext_lams = ext_lams
+            self.use_gate = True
+        else:
+            if external_paths and any(external_paths):
+                logger.warning("SCP external fusion disabled: no valid external matrices loaded.")
 
         # legacy behavior when no external
         if not self.use_gate:
@@ -895,11 +916,38 @@ class StructuredPriorPrompter(nn.Module):
         if not self.use_gate:
             return self.A_star
 
-        # weighted fusion in cosine domain
-        lam = float(self.fuse_lam)
-        lam = max(0.0, min(1.0, lam))
+        # weighted fusion in cosine domain (multi-dataset support)
+        lam_list = [max(0.0, min(1.0, float(lam))) for lam in self.ext_lams]
+        lam_sum = sum(lam_list)
+        if lam_sum > 1.0:
+            logger.warning(
+                "SCP external fusion lambdas sum to %.3f (>1); normalizing to sum=1.0.",
+                lam_sum,
+            )
+            lam_list = [lam / lam_sum for lam in lam_list]
+            lam_sum = 1.0
 
-        A_fused = (1.0 - lam) * self.A_clip_cos + lam * self.A_ext_cos
+        clip_weight = max(0.0, 1.0 - lam_sum)
+        A_ext_fused = torch.zeros_like(self.A_clip_cos)
+        for idx, lam in enumerate(lam_list):
+            A_ext_fused = A_ext_fused + lam * self.A_ext_cos_stack[idx]
+
+        A_fused = clip_weight * self.A_clip_cos + A_ext_fused
+
+        # optional per-group fusion on diagonal blocks (phase/view/action)
+        group_lams = getattr(cfg, "SCP_EXTERNAL_FUSE_LAMBDAS_GROUP", None)
+        if group_lams is not None:
+            if not isinstance(group_lams, (list, tuple)) or len(group_lams) != 3:
+                logger.warning(
+                    "SCP_EXTERNAL_FUSE_LAMBDAS_GROUP should be a list of 3 values; got %s. Skipping.",
+                    str(group_lams),
+                )
+            else:
+                pr, vr, ar = self.phase_range, self.view_range, self.action_range
+                ranges = [pr, vr, ar]
+                for idx, rr in enumerate(ranges):
+                    lam = max(0.0, min(1.0, float(group_lams[idx])))
+                    A_fused[rr, rr] = (1.0 - lam) * self.A_clip_cos[rr, rr] + lam * A_ext_fused[rr, rr]
         A_fused = 0.5 * (A_fused + A_fused.t())  # keep symmetric
         return self._postprocess_cos(A_fused)
 
