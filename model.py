@@ -815,8 +815,11 @@ class StructuredPriorPrompter(nn.Module):
 
         # ---- external fusion (weighted) ----
         self.use_gate = False  # keep name for compatibility with your current MMLSurgAdaptSCPNet
-        self.fuse_lam = float(_cfg("SCP_EXTERNAL_FUSE_LAMBDA", 0.5))  # 0..1
-
+        lam_default = float(_cfg("SCP_EXTERNAL_FUSE_LAMBDA", 0.5))
+        self.fuse_lam_phase  = float(_cfg("SCP_EXTERNAL_FUSE_LAM_PHASE",  lam_default))
+        self.fuse_lam_view   = float(_cfg("SCP_EXTERNAL_FUSE_LAM_VIEW",   lam_default))
+        self.fuse_lam_action = float(_cfg("SCP_EXTERNAL_FUSE_LAM_ACTION", lam_default))
+        self.fuse_lam = self.fuse_lam_phase
         external_path = getattr(cfg, "SCP_EXTERNAL_MATRIX_PATH", None)
         if external_path and os.path.isfile(external_path):
             try:
@@ -835,8 +838,10 @@ class StructuredPriorPrompter(nn.Module):
                 self.register_buffer("A_ext_cos", ext)
                 self.use_gate = True
                 logger.info(
-                    "SCP external fusion enabled (weighted): lam=%.3f, path=%s",
-                    float(self.fuse_lam),
+                    "SCP external fusion source loaded: lam_phase=%.3f, lam_view=%.3f, lam_action=%.3f, path=%s",
+                    float(self.fuse_lam_phase),
+                    float(self.fuse_lam_view),
+                    float(self.fuse_lam_action),
                     str(external_path),
                 )
         elif external_path:
@@ -896,11 +901,28 @@ class StructuredPriorPrompter(nn.Module):
             return self.A_star
 
         # weighted fusion in cosine domain
-        lam = float(self.fuse_lam)
-        lam = max(0.0, min(1.0, lam))
+        lam_p = max(0.0, min(1.0, float(self.fuse_lam_phase)))
+        lam_v = max(0.0, min(1.0, float(self.fuse_lam_view)))
+        lam_a = max(0.0, min(1.0, float(self.fuse_lam_action)))
 
-        A_fused = (1.0 - lam) * self.A_clip_cos + lam * self.A_ext_cos
-        A_fused = 0.5 * (A_fused + A_fused.t())  # keep symmetric
+        A_clip = self.A_clip_cos
+        A_ext  = self.A_ext_cos
+
+        groups = [
+            (self.phase_range,  lam_p),
+            (self.view_range,   lam_v),
+            (self.action_range, lam_a),
+        ]
+
+        A_fused = A_clip.clone()
+
+        # block-wise fusion: lam_block = (lam_i + lam_j)/2
+        for si, li in groups:
+            for sj, lj in groups:
+                lam_block = 0.5 * (li + lj)
+                A_fused[si, sj] = (1.0 - lam_block) * A_clip[si, sj] + lam_block * A_ext[si, sj]
+
+        A_fused = 0.5 * (A_fused + A_fused.t())
         return self._postprocess_cos(A_fused)
 
 
