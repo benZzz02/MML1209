@@ -437,6 +437,9 @@ class SCPNetTrainer():
         debug = getattr(cfg, "debug", False)
         debug_step = getattr(cfg, "debug_step", 200)
 
+        # ✅ gate 打印频率：默认用 gate_print_interval；没配就用 debug_step
+        gate_print_interval = int(getattr(cfg, "gate_print_interval", debug_step))
+
         image = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
@@ -470,6 +473,9 @@ class SCPNetTrainer():
                     out = out[0]
                 loss, _ = criterion(out, target, epoch)
 
+        # =========================
+        # DEBUG PRINTS
+        # =========================
         if debug and is_main_process() and epoch_i % debug_step == 0:
             with torch.no_grad():
                 probs = torch.sigmoid(logits)
@@ -487,8 +493,73 @@ class SCPNetTrainer():
                     f"top1_prob={top1_prob:.3f} | "
                     f"ignore/cls={ignore_cnt:.2f}"
                 )
-        return loss
 
+        # ✅ Gate detail print (更详细)
+        if is_main_process() and (gate_print_interval > 0) and (epoch_i % gate_print_interval == 0):
+            try:
+                # lazy init for previous values
+                if not hasattr(self, "_gate_prev"):
+                    self._gate_prev = None
+
+                model_u = self.model_unwrap
+                if hasattr(model_u, "spp") and getattr(model_u.spp, "raw_cross_gate", None) is not None:
+                    spp = model_u.spp
+
+                    raw = spp.raw_cross_gate.detach().float().cpu()  # logit space
+                    g_sig = torch.sigmoid(spp.raw_cross_gate.detach()).float().cpu()  # pre-clamp
+                    g_used = spp.current_gates_clamped()  # post-clamp used in fusion
+                    lam_used = spp.current_lams()
+
+                    # targets (optional)
+                    lam_t, g_t = None, None
+                    try:
+                        lam_t = spp._lam_target_values().detach().cpu()
+                        g_t = (1.0 - lam_t).detach().cpu()
+                    except Exception:
+                        pass
+
+                    # deltas
+                    d_raw = d_g = d_lam = None
+                    if self._gate_prev is not None:
+                        d_raw = raw - self._gate_prev["raw"]
+                        if g_used is not None:
+                            d_g = g_used - self._gate_prev["g_used"]
+                        if lam_used is not None:
+                            d_lam = lam_used - self._gate_prev["lam_used"]
+
+                    names = ["PV", "PA", "VA"]
+                    parts = []
+                    for k, nm in enumerate(names):
+                        s = (
+                            f"{nm}: raw={raw[k].item():+.3f}, "
+                            f"g_sig={g_sig[k].item():.3f}, "
+                            f"g_used={g_used[k].item():.3f}, "
+                            f"lam={lam_used[k].item():.3f}"
+                        )
+                        if lam_t is not None:
+                            s += f", lam_t={lam_t[k].item():.3f}"
+                        if d_lam is not None:
+                            s += f", d_lam={d_lam[k].item():+.4f}"
+                        if d_g is not None:
+                            s += f", d_g={d_g[k].item():+.4f}"
+                        if d_raw is not None:
+                            s += f", d_raw={d_raw[k].item():+.4f}"
+                        parts.append(s)
+
+                    logger.info(f"[Gate][E{epoch}][I{epoch_i}] " + " | ".join(parts))
+
+                    # update prev
+                    self._gate_prev = {
+                        "raw": raw.clone(),
+                        "g_used": g_used.clone() if g_used is not None else None,
+                        "lam_used": lam_used.clone() if lam_used is not None else None,
+                    }
+
+            except Exception as e:
+                # 不要让 debug 打印影响训练
+                logger.warning(f"[Gate][E{epoch}][I{epoch_i}] gate print failed: {e}")
+
+        return loss
 
 # =============================================================================
 # 验证、初始化验证、保存函数
@@ -705,9 +776,10 @@ def save_best_init(trainer, if_ema_better, dir):
         torch.save(ema_state_dict, os.path.join(save_path, 'model-highest.ckpt'))
     else:
         torch.save(state_dict, os.path.join(save_path, 'model-highest.ckpt'))
-
-
 def train(trainer, dir, run=None) -> list:
+    # -----------------------------
+    # loss
+    # -----------------------------
     loss_dict = {
         'SPLC': SPLC, 'GRLoss': GRLoss, 'Hill': Hill,
         'BCE': lambda: AsymmetricLossOptimized(gamma_neg=0, gamma_pos=0, clip=0),
@@ -736,6 +808,7 @@ def train(trainer, dir, run=None) -> list:
         ),
         'Hill_Ignore': Hill_Ignore
     }
+
     criterion = loss_dict.get(cfg.loss, lambda: None)()
     if criterion is None:
         raise ValueError(f"Loss function '{cfg.loss}' not found.")
@@ -744,11 +817,45 @@ def train(trainer, dir, run=None) -> list:
     if is_main_process():
         print(f"Using criterion: {criterion}")
 
-    parameters = add_weight_decay(trainer.model, cfg.weight_decay)
-    optimizer = torch.optim.Adam(params=parameters, lr=cfg.lr, weight_decay=0)
+    # -----------------------------
+    # unwrap model (DDP-safe)
+    # -----------------------------
+    model_unwrap = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+
+    # -----------------------------
+    # optimizer (two param groups: main + gate)
+    # -----------------------------
+    gate_params = []
+    if hasattr(model_unwrap, "spp") and hasattr(model_unwrap.spp, "gate_parameters"):
+        gate_params = model_unwrap.spp.gate_parameters()
+
+    gate_param_ids = set(id(p) for p in gate_params)
+
+    main_params = []
+    for p in model_unwrap.parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in gate_param_ids:
+            continue
+        main_params.append(p)
+
+    param_groups = [{"params": main_params, "lr": cfg.lr, "weight_decay": cfg.weight_decay}]
+
+    # ✅ gate 小 lr + no weight_decay
+    if len(gate_params) > 0:
+        gate_lr = float(getattr(cfg, "gate_lr", cfg.lr * 0.1))
+        param_groups.append({"params": gate_params, "lr": gate_lr, "weight_decay": 0.0})
+        if is_main_process():
+            logger.info(f"Gate params enabled: {len(gate_params)} | gate_lr={gate_lr:.2e}")
+
+    optimizer = torch.optim.Adam(param_groups)
+
+    # -----------------------------
+    # scheduler / scaler
+    # -----------------------------
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     steps_per_epoch = len(trainer.train_loader)
-    accumulation_steps = getattr(cfg, 'accumulation_steps', 1)
+    accumulation_steps = int(getattr(cfg, 'accumulation_steps', 1))
     optimizer_steps_per_epoch = math.ceil(steps_per_epoch / accumulation_steps)
     total_optimizer_steps = optimizer_steps_per_epoch * cfg.epochs
 
@@ -760,8 +867,7 @@ def train(trainer, dir, run=None) -> list:
     scheduler_T_max = total_optimizer_steps if scheduler_mode == "per_step" else cfg.epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=scheduler_T_max, eta_min=1e-6)
     scaler = GradScaler()
-
-    global_step = 0  # ✅ SwanLab step（optimizer step）
+    global_step = 0
 
     if is_main_process():
         effective_batch = cfg.batch_size * world_size * accumulation_steps
@@ -769,12 +875,19 @@ def train(trainer, dir, run=None) -> list:
             f"Effective batch size (global): {effective_batch} = batch_per_gpu({cfg.batch_size})"
             f" x world_size({world_size}) x accumulation({accumulation_steps})"
         )
+        logger.info(f"Gradient Accumulation Steps: {accumulation_steps}")
 
+    # -----------------------------
+    # checkpoint dir
+    # -----------------------------
     saved_paths = []
     save_dir_base = os.path.join(cfg.checkpoint, dir)
     if is_main_process():
         os.makedirs(save_dir_base, exist_ok=True)
 
+    # -----------------------------
+    # CAP (keep your original logic)
+    # -----------------------------
     use_cap = getattr(cfg, 'use_cap', False)
     cap_start_epoch = getattr(cfg, 'cap_start_epoch', 5)
     cap_ratio = getattr(cfg, 'cap_ratio', 0.6)
@@ -793,65 +906,9 @@ def train(trainer, dir, run=None) -> list:
 
     trainer.model.train()
 
-    if cfg.perform_init:
-        init_optimizer = torch.optim.Adam(params=parameters, lr=cfg.init_lr, weight_decay=0)
-        min_init_loss = float('inf')
-        best_epoch_init = 0
-        init_steps_per_epoch = len(trainer.init_train_loader)
-
-        for epoch in range(cfg.init_epochs):
-            if hasattr(trainer.init_train_loader, 'sampler') and hasattr(trainer.init_train_loader.sampler, 'set_epoch'):
-                trainer.init_train_loader.sampler.set_epoch(epoch)
-
-            for i, (input, target) in enumerate(trainer.init_train_loader):
-                init_optimizer.zero_grad()
-                target = target.cuda(non_blocking=True)
-                image = input.cuda(non_blocking=True)
-                with autocast():
-                    out = trainer.model(image)
-                    if isinstance(out, tuple):
-                        out = out[0]
-                    output = out.float()
-                loss = nn.BCEWithLogitsLoss()(output, target)
-                scaler.scale(loss).backward()
-                scaler.step(init_optimizer)
-                scaler.update()
-                trainer.ema.update(trainer.model)
-
-                if i % 100 == 0 and is_main_process():
-                    logger.info('Init Epoch [{}/{}], Step [{}/{}], LR {:.1e}, Loss: {:.4f}'
-                                .format(epoch, cfg.init_epochs, str(i).zfill(3), str(init_steps_per_epoch).zfill(3),
-                                        cfg.init_lr, loss.item()))
-
-            min_loss, is_ema_better = init_validate(trainer, epoch)
-
-            if is_main_process():
-                if min_loss < min_init_loss:
-                    min_init_loss = min_loss
-                    best_epoch_init = epoch
-                    save_best_init(trainer, is_ema_better, dir)
-                logger.info('current_init_loss = {:.2f}, min_init_loss = {:.2f}, best_epoch={}, is_ema_better={}\n'.
-                            format(min_loss, min_init_loss, best_epoch_init, is_ema_better))
-
-            trainer.model.train()
-
-        if dist.is_initialized():
-            dist.barrier()
-        if is_main_process():
-            map_location = {'cuda:%d' % 0: 'cuda:%d' % cfg.gpu_id}
-            path = f"{cfg.checkpoint}/{dir}/init/model-highest.ckpt"
-            if os.path.exists(path):
-                state_dict = torch.load(path, map_location=map_location)
-                model_to_load = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
-                model_to_load.load_state_dict(state_dict, strict=True)
-                logger.info("Best init model loaded by main process.")
-        if dist.is_initialized():
-            dist.barrier()
-        trainer.model.train()
-
-    if is_main_process():
-        logger.info(f"Gradient Accumulation Steps: {accumulation_steps}")
-
+    # ============================================================
+    # Training loop
+    # ============================================================
     for epoch in range(cfg.epochs):
         if hasattr(trainer.train_loader, 'sampler') and hasattr(trainer.train_loader.sampler, 'set_epoch'):
             trainer.train_loader.sampler.set_epoch(epoch)
@@ -859,45 +916,64 @@ def train(trainer, dir, run=None) -> list:
         if use_cap and epoch >= cap_start_epoch and pos_freq is not None:
             if dist.is_initialized():
                 dist.barrier()
-            run_cap_procedure(trainer, trainer.train_loader, pos_freq, device=torch.device(f"cuda:{cfg.gpu_id}"), ratio=cap_ratio)
+            run_cap_procedure(
+                trainer, trainer.train_loader, pos_freq,
+                device=torch.device(f"cuda:{cfg.gpu_id}"), ratio=cap_ratio
+            )
             if dist.is_initialized():
                 dist.barrier()
 
-        optimizer.zero_grad()
-        for i, batch_data in enumerate(trainer.train_loader):
-            input = batch_data[0]
-            target = batch_data[1]
-            target = target.cuda(non_blocking=True)
-            input = input.cuda(non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
+        for i, batch_data in enumerate(trainer.train_loader):
+            input = batch_data[0].cuda(non_blocking=True)
+            target = batch_data[1].cuda(non_blocking=True)
+
+            # =========================
+            # (1) forward + task loss
+            # =========================
             loss = trainer.train(input, target, criterion, epoch, i)
+
+            # ✅ add gate prior regularization (if enabled in cfg)
+            # 注意：这会让 gate 直接从主 loss 学（你想要的“非 heuristic，可学习”）
+            model_unwrap = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+            if hasattr(model_unwrap, "spp") and hasattr(model_unwrap.spp, "gate_regularization"):
+                loss = loss + model_unwrap.spp.gate_regularization(epoch=epoch, step=i)
+
+            # grad accumulation
             loss = loss / accumulation_steps
             scaler.scale(loss).backward()
 
             if (i + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 trainer.ema.update(trainer.model)
+
                 if scheduler_mode == "per_step":
                     scheduler.step()
 
-                # ✅ SwanLab train step
                 if is_main_process() and run is not None:
+                    base_lr = optimizer.param_groups[0]["lr"]
                     swanlab.log({
                         "train/loss": float(loss.item() * accumulation_steps),
-                        "train/lr": float(optimizer.param_groups[0]["lr"]),
+                        "train/lr": float(base_lr),
                         "epoch": int(epoch),
                     }, step=int(global_step))
                     global_step += 1
 
             if i % 100 == 0 and is_main_process():
                 log_loss = loss.item() * accumulation_steps
-                logger.info('Epoch [{}/{}], Step [{}/{}], LR {:.1e}, Loss: {:.4f}'
-                            .format(epoch, cfg.epochs, str(i).zfill(3), str(steps_per_epoch).zfill(3), cfg.lr, log_loss))
+                cur_lr = optimizer.param_groups[0]["lr"]
+                logger.info(
+                    f"Epoch [{epoch}/{cfg.epochs}], Step [{str(i).zfill(3)}/{str(steps_per_epoch).zfill(3)}], "
+                    f"LR {cur_lr:.2e}, Loss: {log_loss:.4f}"
+                )
 
+        # ---- end of epoch: validate ----
         evals = validate(trainer, epoch, dir, criterion=criterion, run=run)
 
+        # ---- save ckpt ----
         if is_main_process() and evals:
             cur_map = evals['pp_map']
             cur_pp_loss = evals['pp_loss']
@@ -912,18 +988,28 @@ def train(trainer, dir, run=None) -> list:
 
             filename = f"epoch_{epoch}_mAP_{cur_map:.2f}_loss_{cur_pp_loss:.4f}_{suffix}.ckpt"
             filepath = os.path.join(save_dir_base, filename)
-
             torch.save(state_dict, filepath)
             saved_paths.append(filepath)
             logger.info(f"Saved model for epoch {epoch}: {filename}")
 
         trainer.model.train()
+
         if scheduler_mode == "per_epoch":
             scheduler.step()
 
+        if dist.is_initialized():
+            dist.barrier()
+
+        # ---- epoch-end: optional log lam ----
+        if is_main_process():
+            model_unwrap = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+            if hasattr(model_unwrap, "spp") and hasattr(model_unwrap.spp, "current_lams"):
+                lam = model_unwrap.spp.current_lams()
+                if lam is not None:
+                    logger.info(f"[GateLam][E{epoch}] lam(ext)={lam.tolist()}")
+
     final_paths = saved_paths if is_main_process() else []
     return final_paths
-
 
 def test(trainer, dir, checkpoint_paths=None, run=None) -> None:
     if not is_main_process():

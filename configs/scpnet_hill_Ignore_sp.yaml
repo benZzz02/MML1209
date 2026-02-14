@@ -62,9 +62,20 @@ debug: True
 debug_step: 200
 SCP_EXTERNAL_MATRIX_PATH: surgical_matrix_zeroshot.npy
 SCP_EXTERNAL_FUSE_LAMBDA: 0.2
-SCP_EXTERNAL_FUSE_LAM_PHASE: 0.1
-SCP_EXTERNAL_FUSE_LAM_VIEW: 0.1
-SCP_EXTERNAL_FUSE_LAM_ACTION: 0.3
+g0: 0.5
+lam_target: [0.1, 0.1, 0.1]
 
-SCP_SAVE_RELATION_PATH: "text_relation.npy"
-SCP_SAVE_RELATION_JSON_PATH: "text_relation_json.json"
+gate_target_beta: 10.0
+gate_target_warm_epochs: 2
+
+gate_g_min: 0.0
+gate_g_max: 1.0
+
+# ✅ gate 用小 lr（跟主 lr 同量级或更小）
+gate_lr: 5e-3
+
+# ❌ 下面两项是旧的 online-update 逻辑才需要的，新逻辑删掉
+# gate_update_interval: 1
+# gate_broadcast_interval: 10
+
+gate_print_interval: 200   # 每20 step打印一次 gate 变化（想更细就10或5）
