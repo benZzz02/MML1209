@@ -1,5 +1,28 @@
-__pycache__/
-checkpoints/
+# Data
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.csv
+
+# Results
 results/
-visual/
+checkpoints/
+swanlog/
 outputs/
+exp_values/
+
+# Analysis output
+analysis/output/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.vllm_env/

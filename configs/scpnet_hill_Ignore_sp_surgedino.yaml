@@ -1,10 +1,10 @@
 # Training
 n_ctx: 4
-checkpoint: cholec_vals/scpnet_hill_Ignore_sp    # For saving checkpoints
+checkpoint: cholec_vals/scpnet_hill_Ignore_sp_surgedino    # For saving checkpoints
 log_file: scpnet_hill_Ignore_sp.txt
 model_name: scpnet
 batch_size: 32
-accumulation_steps: 1
+accumulation_steps: 2
 lr: 3e-5
 epochs: 8
 reweight_p: 0.2
@@ -29,7 +29,7 @@ init_train_file : triplet_train_labels.json # Init labels
 init_val_file : triplet_val_labels.json # Init labels
 init_epochs : 5
 init_lr : 1e-5
-dir : trial_scpnet_hill_Ignore_sp_rebuttal  # Directory to save results
+dir : trial_scpnet_hill_Ignore_sp_surgedino  # Directory to save results
 loss : Hill_Ignore  # Loss function
 use_lfile : False  # If use label file
 getitem : False # If call random in getitem
@@ -44,7 +44,7 @@ model: SCPNet
 
 # Testing
 ckpt: temp.ckpt  # Ckpt path for inference
-test_dir: trial_test_scpnet_hill_Ignore_sp_rebuttal # Directory to save results
+test_dir: trial_test_scpnet_hill_Ignore_sp_surgedino # Directory to save results
 test_loss: Hill_Ignore  # Loss function
 
 gcn_layers: 3
@@ -60,7 +60,7 @@ SCP_BLOCK_GAMMA: 1.0
 SCP_ENABLE_INTER_COOCCUR_MASK: True
 debug: True
 debug_step: 200
-SCP_EXTERNAL_MATRIX_PATH: surgical_matrix_clip_boosted_gpt-5.2.npy
+SCP_EXTERNAL_MATRIX_PATH: /data/MML1209/A_ext_cos_surgenetdino_dinov3_vitl_seed42.npy
 SCP_EXTERNAL_FUSE_LAMBDA: 0.2
 g0: 0.5
 lam_target: [0.1, 0.1, 0.1]
