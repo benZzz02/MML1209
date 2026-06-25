@@ -1,0 +1,81 @@
+# Training
+n_ctx: 4
+checkpoint: cholec_vals/multiseed/ours_full_s3    # For saving checkpoints
+log_file: multiseed_ours_full_s3.txt
+model_name: scpnet
+batch_size: 32
+accumulation_steps: 1
+lr: 3e-5
+epochs: 8
+reweight_p: 0.2
+relation_file: cholec/word2vec_similarity_matrix.npy
+ratio: 1
+#parent_n_ctx: 4
+#parent_ctx_init: a photo of a
+child_n_ctx: 4
+child_ctx_init: a photo
+change_epoch: 1 # Warmup epoch
+tau: 0.6
+image_size: 224
+num_classes: 110
+super_labels: cholec/cholec_super_labels.txt
+super_labels_index: cholec/cholec_labels_index.npy
+child_num: 110
+label_file: label_jsons/data1.json  # Label file for initialization
+val_sp : True # If single positive validation
+val_methods : ['pp_map', 'pp_loss', 'sp_loss'] # Methods for saving loss
+perform_init : False  # Perform model initialization with triplet pseudolabels
+init_train_file : triplet_train_labels.json # Init labels
+init_val_file : triplet_val_labels.json # Init labels
+init_epochs : 5
+init_lr : 1e-5
+dir : multiseed_ours_full_s3  # Directory to save results
+loss : Hill_Ignore  # Loss function
+use_lfile : False  # If use label file
+getitem : False # If call random in getitem
+# Random in init if both false
+backbone : ViT-L/14
+seed: 3  # Set seed
+partial: False # For partial positive data in training
+model: SCPNet
+#bert_path : /home/swalimbe/surgvlp_trial/Bio_ClinicalBERT  # Bert init for SurgVLP
+#vlp_weights : /home/swalimbe/surgvlp_trial/nips_v1.tar # Ckpt for SurgVLP
+
+
+# Testing
+ckpt: temp.ckpt  # Ckpt path for inference
+test_dir: multiseed_test_ours_full_s3 # Directory to save results
+test_loss: Hill_Ignore  # Loss function
+
+gcn_layers: 3
+sim_threshold: 0.05
+SCP_TOPK_K: 1
+SCP_COMP_ALPHA: 2.0
+SCP_COMP_TEMP: 1.0
+SCP_TOPK_USE_SIGMOID: True
+SCP_ENABLE_LOGIT_COMP: True
+SCP_ENABLE_IGNORE_MASK: True
+SCP_ENABLE_INTRA_MUTEX_MASK: True
+SCP_BLOCK_GAMMA: 1.0
+SCP_ENABLE_INTER_COOCCUR_MASK: True
+debug: True
+debug_step: 200
+SCP_EXTERNAL_MATRIX_PATH: surgical_matrix_clip_boosted_gpt-5.2.npy
+SCP_EXTERNAL_FUSE_LAMBDA: 0.2
+g0: 0.5
+lam_target: [0.1, 0.1, 0.1]
+
+gate_target_beta: 10.0
+gate_target_warm_epochs: 1
+
+gate_g_min: 0.05
+gate_g_max: 0.95
+
+# ✅ gate 用小 lr（跟主 lr 同量级或更小）
+gate_lr: 5e-3
+
+# ❌ 下面两项是旧的 online-update 逻辑才需要的，新逻辑删掉
+# gate_update_interval: 1
+# gate_broadcast_interval: 10
+
+gate_print_interval: 200   # 每20 step打印一次 gate 变化（想更细就10或5）
