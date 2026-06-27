@@ -4,7 +4,7 @@ checkpoint: cholec_vals/multiseed/mml_base_s1    # For saving checkpoints
 log_file: multiseed_mml_base_s1.txt
 model_name: scpnet
 batch_size: 32
-accumulation_steps: 2
+accumulation_steps: 1
 lr: 3e-5
 epochs: 8
 reweight_p: 0.2
@@ -68,11 +68,11 @@ lam_target: [0.1, 0.1, 0.1]
 gate_target_beta: 10.0
 gate_target_warm_epochs: 1
 
-gate_g_min: 0.0
-gate_g_max: 1.0
+gate_g_min: 0.05
+gate_g_max: 0.95
 
 # ✅ gate 用小 lr（跟主 lr 同量级或更小）
-gate_lr: 1e-3
+gate_lr: 5e-3
 
 # ❌ 下面两项是旧的 online-update 逻辑才需要的，新逻辑删掉
 # gate_update_interval: 1
