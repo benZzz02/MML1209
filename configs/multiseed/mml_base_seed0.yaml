@@ -1,7 +1,7 @@
 # Training
 n_ctx: 4
-checkpoint: cholec_vals/multiseed/ours_full_s0    # For saving checkpoints
-log_file: multiseed_ours_full_s0.txt
+checkpoint: cholec_vals/multiseed/mml_base_s0    # For saving checkpoints
+log_file: multiseed_mml_base_s0.txt
 model_name: scpnet
 batch_size: 32
 accumulation_steps: 1
@@ -29,7 +29,7 @@ init_train_file : triplet_train_labels.json # Init labels
 init_val_file : triplet_val_labels.json # Init labels
 init_epochs : 5
 init_lr : 1e-5
-dir : multiseed_ours_full_s0  # Directory to save results
+dir : multiseed_mml_base_s0  # Directory to save results
 loss : Hill_Ignore  # Loss function
 use_lfile : False  # If use label file
 getitem : False # If call random in getitem
@@ -44,7 +44,7 @@ model: SCPNet
 
 # Testing
 ckpt: temp.ckpt  # Ckpt path for inference
-test_dir: multiseed_test_ours_full_s0 # Directory to save results
+test_dir: multiseed_test_mml_base_s0 # Directory to save results
 test_loss: Hill_Ignore  # Loss function
 
 gcn_layers: 3
@@ -68,11 +68,11 @@ lam_target: [0.1, 0.1, 0.1]
 gate_target_beta: 10.0
 gate_target_warm_epochs: 1
 
-gate_g_min: 0.05
-gate_g_max: 0.95
+gate_g_min: 0.0
+gate_g_max: 1.0
 
 # ✅ gate 用小 lr（跟主 lr 同量级或更小）
-gate_lr: 5e-3
+gate_lr: 1e-3
 
 # ❌ 下面两项是旧的 online-update 逻辑才需要的，新逻辑删掉
 # gate_update_interval: 1
