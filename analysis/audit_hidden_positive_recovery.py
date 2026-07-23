@@ -60,8 +60,34 @@ def preparse_args() -> argparse.Namespace:
     )
     parser.add_argument("--candidate-topk", type=int, default=None)
     parser.add_argument("--thresholds", default="0.3,0.5")
-    parser.add_argument("--disable-lc", action="store_true")
-    parser.add_argument("--disable-ignore", action="store_true")
+    lc_group = parser.add_mutually_exclusive_group()
+    lc_group.add_argument(
+        "--enable-lc",
+        dest="lc_override",
+        action="store_true",
+        default=None,
+        help="Override YAML and enable logit compensation.",
+    )
+    lc_group.add_argument(
+        "--disable-lc",
+        dest="lc_override",
+        action="store_false",
+        help="Override YAML and disable logit compensation.",
+    )
+    ignore_group = parser.add_mutually_exclusive_group()
+    ignore_group.add_argument(
+        "--enable-ignore",
+        dest="ignore_override",
+        action="store_true",
+        default=None,
+        help="Override YAML and enable ignore-mask candidate logic.",
+    )
+    ignore_group.add_argument(
+        "--disable-ignore",
+        dest="ignore_override",
+        action="store_false",
+        help="Override YAML and disable ignore-mask candidate logic.",
+    )
     parser.add_argument("--external-matrix", default=None)
     parser.add_argument("--no-external", action="store_true")
     parser.add_argument("--skip-missing", action="store_true")
@@ -383,8 +409,10 @@ def validate_case_image_paths(cases: List[AuditCase], skip_missing: bool) -> Lis
 
 def configure_runtime(args: argparse.Namespace) -> None:
     global_cfg.perform_init = False
-    global_cfg.SCP_ENABLE_LOGIT_COMP = not args.disable_lc
-    global_cfg.SCP_ENABLE_IGNORE_MASK = not args.disable_ignore
+    if args.lc_override is not None:
+        global_cfg.SCP_ENABLE_LOGIT_COMP = bool(args.lc_override)
+    if args.ignore_override is not None:
+        global_cfg.SCP_ENABLE_IGNORE_MASK = bool(args.ignore_override)
     if args.candidate_topk is not None:
         global_cfg.SCP_TOPK_K = int(args.candidate_topk)
     if args.external_matrix is not None:
